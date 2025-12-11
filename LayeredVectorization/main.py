@@ -2,12 +2,15 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 import argparse
+from TranSalNet.TranSalNet_Res import TranSalNet
+from TranSalNet.utils.data_process import postprocess_img, preprocess_img
 from utils.img_process import *
 import os
 from tqdm import tqdm
 from sds_image_simplicity import sds_based_simplification
 import pydiffvg
 import yaml
+import cv2
 
 def init_diffvg(device: torch.device,
                 use_gpu: bool = torch.cuda.is_available(),
@@ -196,6 +199,23 @@ def svg_optimize_img_visual(device, shapes, shape_groups,
             pbar.update(1)
     return shapes,shape_groups,count
 
+def compute_saliency_map(device: torch.device, target_img: np.ndarray):
+    model = TranSalNet()
+    model.load_state_dict(torch.load(r'./TranSalNet/pretrained_models/TranSalNet_Res.pth'))
+    model = model.to(device) 
+    model.eval()
+    img = preprocess_img(target_img) # padding and resizing input image into 384x288
+    img = np.array(img)/255.
+    img = np.expand_dims(np.transpose(img,(2,0,1)),axis=0)
+    img = torch.from_numpy(img)
+    img = img.type(torch.cuda.FloatTensor).to(device)
+    pred_saliency = model(img)
+    toPIL = transforms.ToPILImage()
+    pic = toPIL(pred_saliency.squeeze())
+
+    pred_saliency = postprocess_img(pic, target_img) # restore the image to its original size as the result
+    return pred_saliency
+
 def layered_vectorization(args,device=None):
     simp_img_seq_save_path = f"./workdir/{args.file_save_name}/simplified_image_sequence"
     os.makedirs(simp_img_seq_save_path,exist_ok=True)
@@ -250,6 +270,8 @@ def layered_vectorization(args,device=None):
     is_opt_list = []
     count = 0
     struct_path_num = len(shapes)
+    saliency_map = compute_saliency_map(device,target_img)
+    cv2.imwrite(f"./workdir/{args.file_save_name}/saliency_map.png", saliency_map, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
     for i in range(args.add_visual_path_num_iters):
         os.makedirs(f"{visual_svgs_save_path}/{i}_add_paths",exist_ok=True)
         if i == args.add_visual_path_num_iters-1:
@@ -262,7 +284,8 @@ def layered_vectorization(args,device=None):
                                                                                                 pseudo_struct_masks,
                                                                                                 is_opt_list,
                                                                                                 epsilon=args.approxpolydp_epsilon,
-                                                                                                N=remaining_path_num)
+                                                                                                N=remaining_path_num,
+                                                                                                saliency_map=saliency_map)
         if struct_path_num == -1:
             print("There are no new paths to add.")
             break
