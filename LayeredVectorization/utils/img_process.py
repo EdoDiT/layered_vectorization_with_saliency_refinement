@@ -366,9 +366,6 @@ def color_fitting(shape_groups, target_img: np.ndarray, layerd_struct_masks: lis
         shape_group.fill_color=torch.FloatTensor(most_common_color_list[i]+[255])/255
     return shape_groups,target_img
 
-import numpy as np
-import cv2
-
 def select_mask_by_conn_area(
         pred: np.ndarray,
         gt: np.ndarray,
@@ -483,9 +480,6 @@ def select_mask_by_conn_area(
     else:
         selected_candidates = candidates
     
-    for c in range(min(10, len(selected_candidates))):
-        print(f"Selected Mask - Score: {selected_candidates[c]['score']:.4f}, Saliency: {selected_candidates[c]['metrics']['saliency']:.4f}, Magnitude: {selected_candidates[c]['metrics']['magnitude']:.4f}, Area: {selected_candidates[c]['metrics']['area']:.4f}")
-
     # 5. Convert to Output Format (uint8 0-255 masks)
     final_masks = []
     for c in selected_candidates:

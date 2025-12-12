@@ -3,3 +3,8 @@ diffvg/
 pretrained_models
 __pycache__/
 /LayeredVectorization/TranSalNet/datasets
+**/all_simplified_image_sequence/
+**/masks/
+**/struct_svgs/
+**/struct&visual_svgs/
+**/__pycache__/
