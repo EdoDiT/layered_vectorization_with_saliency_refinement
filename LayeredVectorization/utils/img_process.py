@@ -366,172 +366,134 @@ def color_fitting(shape_groups, target_img: np.ndarray, layerd_struct_masks: lis
         shape_group.fill_color=torch.FloatTensor(most_common_color_list[i]+[255])/255
     return shape_groups,target_img
 
+import numpy as np
+import cv2
+
 def select_mask_by_conn_area(
         pred: np.ndarray,
         gt: np.ndarray,
         saliency_map: np.ndarray,
         N: int = -1,
-        saliency_threshold: float = 0.5,
-        adaptive_factor: float = 0.5,
-        large_area_threshold: float = 0.001,
-        tier1_max_ratio: float = 0.7,
-        tier2_max_ratio: float = 0.3
+        area_weight: float = 3.0,
+        saliency_boost: float = 1.0,
+        min_area: int = 4
     ):
     """
-    Select masks using a three-tier prioritization strategy:
-    - Tier 1: Important focal details (high saliency + high magnitude + sufficient area)
-    - Tier 2: Large background areas (low saliency + large area)
-    - Tier 3: Smaller focal refinements (high saliency + lower magnitude/area)
-    
+    Select masks using a unified leaderboard strategy.
+    Ranking is based on a composite score of Focal Intensity (saliency * magnitude)
+    and Spatial Presence (weighted area).
+
     Args:
         pred: Predicted image
         gt: Ground truth image
         saliency_map: Saliency map with values in [0, 1]
-        N: Maximum number of masks to return
-        saliency_threshold: Threshold to distinguish focal (>=) from non-focal regions
-        adaptive_factor: Multiplier for median area to compute min_area_threshold
-        large_area_threshold: Minimum normalized area for Tier 2 components
-        tier1_max_ratio: Maximum fraction of N that can come from Tier 1
-        tier2_max_ratio: Maximum fraction of N that can come from Tier 2
+        N: Maximum number of masks to return (-1 for all)
+        area_weight: Coefficient to boost importance of large areas.
+                     Higher values (e.g., 2.0-5.0) allow large background blobs 
+                     to outrank small, mediocre focal details.
+        saliency_boost: Multiplier for the focal term (optional tuning).
+        min_area: Hard filter for minimum pixel size to ignore pure noise.
     """
-    map = ((pred - gt)**2).sum(0)
+    # 1. Compute Difference Map (unchanged logic for consistency)
+    map_diff = ((pred - gt)**2).sum(0)
+    
+    quantile_interval = 139
+    nodiff_thres = 0.025
+    map_diff[map_diff < nodiff_thres] = 0
 
-    quantile_interval=139
-    nodiff_thres=0.025
-    map[map < nodiff_thres] = 0
-
-    quantile_interval = np.linspace(0., 1., quantile_interval)
-    quantized_interval = np.quantile(map, quantile_interval)
-    # remove redundant
+    q_vals = np.linspace(0., 1., quantile_interval)
+    quantized_interval = np.quantile(map_diff, q_vals)
     quantized_interval = np.unique(quantized_interval)
     quantized_interval = sorted(quantized_interval[1:-1])
-    map = np.digitize(map, quantized_interval, right=False)
-    map = np.clip(map, 0, 255).astype(np.uint8)
-
-    csize_list = []
-    component_list = []
-    bin_levels = []  # Store which bin each component belongs to
-    for idi in np.unique(map):
-        if idi==0:
-            continue
-        _, component, cstats, _ = cv2.connectedComponentsWithStats(
-            (map==idi).astype(np.uint8), connectivity=4)
-        csize = [c[-1] for c in cstats[1:]]
-        csize_list.append(csize)
-        component_list.append(component)
-        bin_levels.append(idi)
-
-    if len(csize_list)==0:
-        return []
     
-    # Collect all component information
-    image_area = map.shape[0] * map.shape[1]
-    all_components = []
+    # map_bins contains values 0..255 indicating error magnitude
+    map_bins = np.digitize(map_diff, quantized_interval, right=False)
+    map_bins = np.clip(map_bins, 0, 255).astype(np.uint8)
+
+    # 2. Extract Connected Components
+    # We flatten the process to collect all candidates into one list immediately
+    candidates = []
+    image_total_area = map_bins.shape[0] * map_bins.shape[1]
     
-    for bin_idx, (sizes, component_map, bin_level) in enumerate(zip(csize_list, component_list, bin_levels)):
-        for comp_idx, area in enumerate(sizes):
-            if area < 1:
+    # Iterate over non-zero bin levels
+    unique_levels = np.unique(map_bins)
+    if unique_levels[0] == 0:
+        unique_levels = unique_levels[1:]
+
+    for level in unique_levels:
+        # Create binary mask for this level
+        level_mask = (map_bins == level).astype(np.uint8)
+        
+        # Connected components
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(level_mask, connectivity=4)
+        
+        # Iterate components (skip label 0 which is background of the mask)
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            
+            if area < min_area:
                 continue
-                
-            # Get the component mask
-            mask = (component_map == comp_idx + 1).astype(bool)
+
+            # Extract mask for this specific component
+            comp_mask = (labels == i)
             
-            # Calculate average saliency for this component
-            saliency_values = saliency_map[mask]
-            avg_saliency = np.mean(saliency_values) if len(saliency_values) > 0 else 0
+            # --- SCORING METRICS ---
             
-            # Normalize metrics
-            normalized_magnitude = bin_level / 255.0
-            normalized_area = area / image_area
+            # 1. Focal Intensity: Saliency * Magnitude
+            # (Magnitude is normalized 0-1 from the bin level)
+            norm_magnitude = level / 255.0
             
-            all_components.append({
-                'bin_idx': bin_idx,
-                'comp_idx': comp_idx,
-                'area': area,
-                'normalized_area': normalized_area,
-                'avg_saliency': avg_saliency,
-                'normalized_magnitude': normalized_magnitude
+            # Mean saliency under the mask
+            # Optimization: Use mask slicing/indexing rather than full image multiplication if possible
+            # but boolean indexing is fast enough here.
+            raw_saliency = np.mean(saliency_map[comp_mask])
+            comp_saliency = raw_saliency/255.0
+            
+            focal_score = comp_saliency * norm_magnitude
+            
+            # 2. Area Term (Geometric Fix)
+            # We use SQRT to make Area linearly comparable to Intensity
+            # Example: 1% area (0.01) -> sqrt -> 0.1 (Now it matches magnitude scale)
+            norm_area_linear = area / image_total_area
+            norm_area = np.sqrt(norm_area_linear)
+            
+            # --- FINAL SCORE ---
+            # Score = (Intensity) + (Weighted Area)
+            # Adjust 'saliency_boost' to make details pop more, 
+            # or 'area_weight' to make background pop more.
+            final_score = (focal_score * saliency_boost) + (norm_area * area_weight)
+            
+            candidates.append({
+                'mask': comp_mask,  # Store boolean mask directly
+                'score': final_score,
+                'metrics': {
+                    'saliency': comp_saliency,
+                    'magnitude': norm_magnitude,
+                    'area': norm_area
+                }
             })
-    
-    if len(all_components) == 0:
-        return []
-    
-    # Calculate adaptive area threshold based on median component size
-    all_areas = [comp['area'] for comp in all_components]
-    median_area = np.median(all_areas)
-    min_area_threshold = (median_area / image_area) * adaptive_factor
-    
-    # Split components into tiers
-    tier1_components = []  # Focal important details
-    tier2_components = []  # Non-focal large areas
-    tier3_components = []  # Remaining focal details
-    
-    for comp in all_components:
-        is_focal = comp['avg_saliency'] >= saliency_threshold
-        
-        if is_focal:
-            # Focal region: check if it meets area threshold for tier 1
-            if comp['normalized_area'] >= min_area_threshold:
-                # Tier 1: Important focal details with sufficient size
-                # Score: magnitude * saliency * area_boost
-                area_boost = np.sqrt(comp['normalized_area'] / min_area_threshold)
-                score = comp['normalized_magnitude'] * comp['avg_saliency'] * area_boost
-                tier1_components.append((score, comp))
-            else:
-                # Tier 3: Smaller focal details
-                # Score: area * saliency * magnitude (with floor)
-                magnitude_with_floor = max(comp['normalized_magnitude'], 0.3)
-                score = comp['normalized_area'] * comp['avg_saliency'] * magnitude_with_floor
-                tier3_components.append((score, comp))
-        else:
-            # Non-focal region
-            if comp['normalized_area'] >= large_area_threshold:
-                # Tier 2: Large background areas
-                # Score: area only
-                score = comp['normalized_area']
-                tier2_components.append((score, comp))
-            # Small non-focal components are ignored
-    
-    # Sort each tier by score (descending)
-    tier1_components.sort(key=lambda x: x[0], reverse=True)
-    tier2_components.sort(key=lambda x: x[0], reverse=True)
-    tier3_components.sort(key=lambda x: x[0], reverse=True)
-    
-    # Apply tier distribution limits
-    selected_components = []
-    
+
+    # 3. Leaderboard Sorting
+    # Sort descending by score
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+
+    # 4. Selection
     if N > 0:
-        # Calculate tier limits
-        tier1_limit = int(N * tier1_max_ratio)
-        tier2_limit = int(N * tier2_max_ratio)
-        
-        # Select from tier 1
-        tier1_selected = tier1_components[:tier1_limit]
-        selected_components.extend([comp for _, comp in tier1_selected])
-        
-        # Select from tier 2
-        remaining = N - len(selected_components)
-        tier2_count = min(tier2_limit, remaining, len(tier2_components))
-        tier2_selected = tier2_components[:tier2_count]
-        selected_components.extend([comp for _, comp in tier2_selected])
-        
-        # Fill remaining quota from tier 3
-        remaining = N - len(selected_components)
-        tier3_selected = tier3_components[:remaining]
-        selected_components.extend([comp for _, comp in tier3_selected])
+        selected_candidates = candidates[:N]
     else:
-        # If N <= 0, return all components in tier order
-        selected_components.extend([comp for _, comp in tier1_components])
-        selected_components.extend([comp for _, comp in tier2_components])
-        selected_components.extend([comp for _, comp in tier3_components])
+        selected_candidates = candidates
     
-    # Generate masks
-    masks = []
-    for comp in selected_components:
-        mask = (component_list[comp['bin_idx']] == comp['comp_idx'] + 1).astype(np.uint8)
-        masks.append(mask * 255)
-    
-    return masks
+    for c in range(min(10, len(selected_candidates))):
+        print(f"Selected Mask - Score: {selected_candidates[c]['score']:.4f}, Saliency: {selected_candidates[c]['metrics']['saliency']:.4f}, Magnitude: {selected_candidates[c]['metrics']['magnitude']:.4f}, Area: {selected_candidates[c]['metrics']['area']:.4f}")
+
+    # 5. Convert to Output Format (uint8 0-255 masks)
+    final_masks = []
+    for c in selected_candidates:
+        # Convert boolean mask to uint8 255
+        m = c['mask'].astype(np.uint8) * 255
+        final_masks.append(m)
+        
+    return final_masks
 
 def insert_in_struct_layer(mask: Union[np.ndarray,torch.Tensor],struct_masks: List[np.ndarray]):
     if isinstance(mask,torch.Tensor):

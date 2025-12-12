@@ -249,7 +249,7 @@ def layered_vectorization(args,device=None):
     print("Layered Structure Reconstruction...")
     # Structural layer optimization.
     layerd_struct_masks = layer_segmented_masks([[masks[0]]],masks[1:])
-    layerd_struct_masks = get_struct_masks_by_area(layerd_struct_masks,int(args.max_path_num_limit*0.4))
+    layerd_struct_masks = get_struct_masks_by_area(layerd_struct_masks,int(args.max_path_num_limit*0.7))
     shapes,shape_groups = init_svg_by_mask(layerd_struct_masks,target_img,args.approxpolydp_epsilon)
     shapes,shape_groups = svg_optimize_img_struct(device,shapes,shape_groups,
                                                   target_img,
@@ -277,7 +277,7 @@ def layered_vectorization(args,device=None):
         if i == args.add_visual_path_num_iters-1:
             remaining_path_num = args.max_path_num_limit-len(shapes)
         else:
-            remaining_path_num = int((args.max_path_num_limit-len(shapes))*0.6)
+            remaining_path_num = int((args.max_path_num_limit-len(shapes))*0.4)
         shapes,shape_groups,pseudo_struct_masks,is_opt_list,struct_path_num = add_visual_paths(shapes,shape_groups,device,
                                                                                                 struct_path_num,
                                                                                                 target_img_cluster,

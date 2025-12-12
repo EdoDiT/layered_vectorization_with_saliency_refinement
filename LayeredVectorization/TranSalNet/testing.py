@@ -14,7 +14,7 @@ flag = 1 # 0 for TranSalNet_Dense, 1 for TranSalNet_Res
 if flag:
     from TranSalNet_Res import TranSalNet
     model = TranSalNet()
-    model.load_state_dict(torch.load(r'pretrained_models/TranSalNet_Res.pth'))
+    model.load_state_dict(torch.load(r'/home/sagemaker-user/layered_vectorization/LayeredVectorization/TranSalNet/pretrained_models/TranSalNet_Res.pth'))
 else:
     from TranSalNet_Dense import TranSalNet
     model = TranSalNet()
@@ -22,7 +22,7 @@ else:
 
 model = model.to(device) 
 model.eval()
-test_img = r'example/COCO_val2014_000000005107.jpg' 
+test_img = r'/home/sagemaker-user/layered_vectorization/LayeredVectorization/TranSalNet/example/ghirri_lake_ours.png' 
 
 img = preprocess_img(test_img) # padding and resizing input image into 384x288
 img = np.array(img)/255.
@@ -35,5 +35,5 @@ pic = toPIL(pred_saliency.squeeze())
 
 pred_saliency = postprocess_img(pic, test_img) # restore the image to its original size as the result
 
-cv2.imwrite(r'example/result.png', pred_saliency, [int(cv2.IMWRITE_JPEG_QUALITY), 100]) # save the result
-print('Finished, check the result at: {}'.format(r'example/result.png'))
+cv2.imwrite(r'/home/sagemaker-user/layered_vectorization/LayeredVectorization/TranSalNet/example/result_ghirri_lake_ours.png', pred_saliency, [int(cv2.IMWRITE_JPEG_QUALITY), 100]) # save the result
+print('Finished, check the result at: {}'.format(r'/home/sagemaker-user/layered_vectorization/LayeredVectorization/TranSalNet/example/result_ghirri_lake_ours.png'))
