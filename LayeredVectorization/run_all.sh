@@ -21,3 +21,4 @@ python main.py --config config/base_config.yaml --target_image target_imgs/resiz
 python main.py --config config/base_config.yaml --target_image target_imgs/resized_still_life.jpg --file_save_name still_life_with_saliency
 python main.py --config config/base_config.yaml --target_image target_imgs/resized_tree.jpg --file_save_name tree_with_saliency
 python main.py --config config/base_config.yaml --target_image target_imgs/resized_vietnam.jpg --file_save_name vietnam_with_saliency
+python main.py --config config/base_config.yaml --target_image target_imgs/robot.png --file_save_name robot_with_saliency

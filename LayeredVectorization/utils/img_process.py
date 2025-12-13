@@ -371,8 +371,8 @@ def select_mask_by_conn_area(
         gt: np.ndarray,
         saliency_map: np.ndarray,
         N: int = -1,
-        area_weight: float = 3.0,
-        saliency_boost: float = 1.0,
+        area_weight: float = 2.0,
+        saliency_log_strength: float = 10.0,
         min_area: int = 4
     ):
     """
@@ -388,7 +388,6 @@ def select_mask_by_conn_area(
         area_weight: Coefficient to boost importance of large areas.
                      Higher values (e.g., 2.0-5.0) allow large background blobs 
                      to outrank small, mediocre focal details.
-        saliency_boost: Multiplier for the focal term (optional tuning).
         min_area: Hard filter for minimum pixel size to ignore pure noise.
     """
     # 1. Compute Difference Map (unchanged logic for consistency)
@@ -443,10 +442,19 @@ def select_mask_by_conn_area(
             # Mean saliency under the mask
             # Optimization: Use mask slicing/indexing rather than full image multiplication if possible
             # but boolean indexing is fast enough here.
+            # 1. Saliency with Log Smoothing
             raw_saliency = np.mean(saliency_map[comp_mask])
-            comp_saliency = raw_saliency/255.0
+            norm_saliency = raw_saliency / 255.0
             
-            focal_score = comp_saliency * norm_magnitude
+            if saliency_log_strength > 0:
+                # Log normalization formula: ln(1 + a*x) / ln(1 + a)
+                # This maps 0->0 and 1->1, but boosts the middle.
+                log_saliency = np.log(1 + saliency_log_strength * norm_saliency) / \
+                               np.log(1 + saliency_log_strength)
+            else:
+                log_saliency = norm_saliency
+            
+            focal_score = log_saliency * norm_magnitude
             
             # 2. Area Term (Geometric Fix)
             # We use SQRT to make Area linearly comparable to Intensity
@@ -456,15 +464,14 @@ def select_mask_by_conn_area(
             
             # --- FINAL SCORE ---
             # Score = (Intensity) + (Weighted Area)
-            # Adjust 'saliency_boost' to make details pop more, 
             # or 'area_weight' to make background pop more.
-            final_score = (focal_score * saliency_boost) + (norm_area * area_weight)
+            final_score = focal_score + (norm_area * area_weight)
             
             candidates.append({
                 'mask': comp_mask,  # Store boolean mask directly
                 'score': final_score,
                 'metrics': {
-                    'saliency': comp_saliency,
+                    'saliency': log_saliency,
                     'magnitude': norm_magnitude,
                     'area': norm_area
                 }
