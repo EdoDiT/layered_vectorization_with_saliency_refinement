@@ -1000,6 +1000,280 @@ def _render_alpha_mask(width: int, height: int, shapes_subset: list, device) -> 
     return rendered[:, :, 3] > 0.5
 
 
+def _get_mask_bbox(mask_bool: np.ndarray):
+    """Return (ymin, ymax, xmin, xmax) bounding box for a boolean mask."""
+    ys, xs = np.where(mask_bool)
+    if len(ys) == 0:
+        return (0, 0, 0, 0)
+    return (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1)
+
+
+def _bboxes_overlap(b1, b2) -> bool:
+    """Return True if two (ymin, ymax, xmin, xmax) boxes have non-empty intersection."""
+    return (b1[0] < b2[1]) and (b2[0] < b1[1]) and (b1[2] < b2[3]) and (b2[2] < b1[3])
+
+
+def _fill_small_holes(mask_bool: np.ndarray, max_hole_area: int = 64) -> np.ndarray:
+    """Fill small interior pinholes in a boolean mask without altering large interior holes."""
+    h, w = mask_bool.shape[:2]
+    inv = (~mask_bool).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    for lbl in range(1, num_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] <= max_hole_area:
+            left = stats[lbl, cv2.CC_STAT_LEFT]
+            top = stats[lbl, cv2.CC_STAT_TOP]
+            width = stats[lbl, cv2.CC_STAT_WIDTH]
+            height = stats[lbl, cv2.CC_STAT_HEIGHT]
+            if left > 0 and top > 0 and (left + width) < w and (top + height) < h:
+                mask_bool[labels == lbl] = True
+    return mask_bool
+
+
+def merge_struct_shapes(
+    device,
+    shapes: list,
+    shape_groups: list,
+    target_img: np.ndarray,
+    layerd_struct_masks: list,
+    epsilon: int = 5,
+    distance_threshold: int = 6,
+    color_range_pct: float = 0.13,
+    max_intervening_overlap: int = 10,
+    min_contact_pixels: int = 4,
+):
+    """
+    Merge structural shapes that are spatially close or partly overlapping,
+    contiguous in the layer stack, and have relatively similar colors scaled by
+    each channel's contrast-aware dynamic range and local boundary slope.
+    """
+    flat_masks = []
+    flat_layer_ids = []
+    for layer_idx, masks in enumerate(layerd_struct_masks):
+        for mask in masks:
+            flat_masks.append(mask)
+            flat_layer_ids.append(layer_idx)
+
+    if len(shapes) <= 2 or len(flat_masks) != len(shapes):
+        return shapes, shape_groups, layerd_struct_masks
+
+    img_height, img_width = target_img.shape[:2]
+    target_float = target_img.astype(np.float32) / 255.0
+
+    # Per-channel full dynamic range modulated by image contrast (95th - 5th percentile)
+    full_range = target_float.max(axis=(0, 1)) - target_float.min(axis=(0, 1))
+    p95 = np.percentile(target_float, 95, axis=(0, 1))
+    p5 = np.percentile(target_float, 5, axis=(0, 1))
+    contrast_range = p95 - p5
+    effective_range = np.maximum(full_range * contrast_range, 0.05)
+    channel_thresholds = color_range_pct * effective_range  # per-channel [R, G, B] tolerance
+
+    with torch.no_grad():
+        raw_masks = []
+        for i, shape in enumerate(shapes):
+            alpha = _render_alpha_mask(img_width, img_height, [shape], device).detach().cpu().numpy()
+            if not np.any(alpha):
+                alpha = flat_masks[i] > 127
+            raw_masks.append(alpha)
+
+    max_layer_id = max(flat_layer_ids) if flat_layer_ids else 0
+    layer_union = [np.zeros((img_height, img_width), dtype=bool) for _ in range(max_layer_id + 1)]
+    for m, lid in zip(raw_masks, flat_layer_ids):
+        layer_union[lid] |= m
+
+    upper_union_by_layer = [np.zeros((img_height, img_width), dtype=bool) for _ in range(max_layer_id + 1)]
+    running_upper = np.zeros((img_height, img_width), dtype=bool)
+    for l in range(max_layer_id, -1, -1):
+        upper_union_by_layer[l] = running_upper.copy()
+        running_upper |= layer_union[l]
+
+    radius = max(1, (distance_threshold + 1) // 2 + 1)
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    records = []
+    for i in range(len(shapes)):
+        m_bool = raw_masks[i].copy()
+        lid = flat_layer_ids[i]
+        vis_bool = m_bool & (~upper_union_by_layer[lid])
+        area = max(int(np.sum(m_bool)), 1)
+        vis_area = int(np.sum(vis_bool))
+
+        if vis_area >= 16:
+            color = target_float[vis_bool].mean(axis=0).astype(np.float32)
+        elif int(np.sum(m_bool)) > 0:
+            color = target_float[m_bool].mean(axis=0).astype(np.float32)
+        else:
+            color = shape_groups[i].fill_color[:3].detach().cpu().numpy().astype(np.float32)
+
+        dil_u8 = cv2.dilate(m_bool.astype(np.uint8) * 255, dilate_kernel)
+        dil_bool = dil_u8 > 127
+
+        records.append({
+            "orig_idx": i,
+            "layer_id": lid,
+            "mask": m_bool,
+            "vis_mask": vis_bool if vis_area >= 16 else m_bool,
+            "dil_mask": dil_bool,
+            "bbox": _get_mask_bbox(m_bool),
+            "dil_bbox": _get_mask_bbox(dil_bool),
+            "area": area,
+            "color": color,
+            "color_min": color.copy(),
+            "color_max": color.copy(),
+            "merged_count": 1,
+        })
+
+    # Keep index 0 (full-canvas background layer) intact; iteratively merge structural shapes 1..N-1
+    changed = True
+    while changed:
+        changed = False
+        i = 1
+        while i < len(records):
+            rec_i = records[i]
+            j = i + 1
+            merged_in_inner = False
+            while j < len(records):
+                rec_j = records[j]
+
+                # 1. Layer stack contiguity (part A): same or adjacent structural layer
+                if rec_j["layer_id"] - rec_i["layer_id"] > 1:
+                    break
+
+                # 2. Dynamic-range-aware per-channel color similarity
+                if np.any(np.abs(rec_i["color"] - rec_j["color"]) > channel_thresholds):
+                    j += 1
+                    continue
+
+                new_cmin = np.minimum(rec_i["color_min"], rec_j["color_min"])
+                new_cmax = np.maximum(rec_i["color_max"], rec_j["color_max"])
+                if np.any((new_cmax - new_cmin) > 1.35 * channel_thresholds):
+                    j += 1
+                    continue
+
+                # 3. Spatial closeness or partial overlap
+                if not _bboxes_overlap(rec_i["dil_bbox"], rec_j["dil_bbox"]):
+                    j += 1
+                    continue
+
+                y0 = max(rec_i["dil_bbox"][0], rec_j["dil_bbox"][0])
+                y1 = min(rec_i["dil_bbox"][1], rec_j["dil_bbox"][1])
+                x0 = max(rec_i["dil_bbox"][2], rec_j["dil_bbox"][2])
+                x1 = min(rec_i["dil_bbox"][3], rec_j["dil_bbox"][3])
+
+                bridge_crop = rec_i["dil_mask"][y0:y1, x0:x1] & rec_j["dil_mask"][y0:y1, x0:x1]
+                contact_px = int(np.sum(bridge_crop))
+                min_req_px = min(min_contact_pixels, max(1, int(0.2 * min(rec_i["area"], rec_j["area"]))))
+                if contact_px < min_req_px:
+                    j += 1
+                    continue
+
+                # Local directional color derivative (low slope across interface between shape i and shape j)
+                strip_i = rec_i["vis_mask"][y0:y1, x0:x1] & rec_j["dil_mask"][y0:y1, x0:x1]
+                strip_j = rec_j["vis_mask"][y0:y1, x0:x1] & rec_i["dil_mask"][y0:y1, x0:x1]
+                if int(np.sum(strip_i)) >= 8 and int(np.sum(strip_j)) >= 8:
+                    target_crop = target_float[y0:y1, x0:x1]
+                    local_ci = target_crop[strip_i].mean(axis=0)
+                    local_cj = target_crop[strip_j].mean(axis=0)
+                    if np.any(np.abs(local_ci - local_cj) > 1.25 * channel_thresholds):
+                        j += 1
+                        continue
+
+                # 4. Layer stack contiguity (part B): no intermediate shape k in (i, j) occludes/separates them
+                is_stack_contiguous = True
+                if j > i + 1:
+                    bi = rec_i["bbox"]
+                    bj = rec_j["bbox"]
+                    ub = (min(bi[0], bj[0]), max(bi[1], bj[1]), min(bi[2], bj[2]), max(bi[3], bj[3]))
+                    uy0, uy1, ux0, ux1 = ub
+                    combined_crop = rec_i["mask"][uy0:uy1, ux0:ux1] | rec_j["mask"][uy0:uy1, ux0:ux1]
+                    for k in range(i + 1, j):
+                        rec_k = records[k]
+                        if not _bboxes_overlap(rec_k["bbox"], ub):
+                            continue
+                        inter_px = int(np.sum(rec_k["mask"][uy0:uy1, ux0:ux1] & combined_crop))
+                        if inter_px > max_intervening_overlap:
+                            is_stack_contiguous = False
+                            break
+
+                if not is_stack_contiguous:
+                    j += 1
+                    continue
+
+                # Merge rec_j into rec_i with local bridging
+                merged_mask = rec_i["mask"] | rec_j["mask"]
+                merged_mask[y0:y1, x0:x1] |= bridge_crop
+                crop_u8 = merged_mask[y0:y1, x0:x1].astype(np.uint8) * 255
+                crop_u8 = cv2.morphologyEx(crop_u8, cv2.MORPH_CLOSE, close_kernel)
+                merged_mask[y0:y1, x0:x1] = crop_u8 > 127
+                merged_mask = _fill_small_holes(merged_mask, max_hole_area=64)
+
+                merged_vis = rec_i["vis_mask"] | rec_j["vis_mask"]
+                new_area = max(int(np.sum(merged_mask)), 1)
+                if int(np.sum(merged_vis)) >= 16:
+                    new_color = target_float[merged_vis].mean(axis=0).astype(np.float32)
+                else:
+                    total_w = rec_i["area"] + rec_j["area"]
+                    new_color = ((rec_i["color"] * rec_i["area"] + rec_j["color"] * rec_j["area"]) / total_w).astype(np.float32)
+
+                dil_u8 = cv2.dilate(merged_mask.astype(np.uint8) * 255, dilate_kernel)
+                dil_bool = dil_u8 > 127
+
+                rec_i["mask"] = merged_mask
+                rec_i["vis_mask"] = merged_vis
+                rec_i["dil_mask"] = dil_bool
+                rec_i["bbox"] = _get_mask_bbox(merged_mask)
+                rec_i["dil_bbox"] = _get_mask_bbox(dil_bool)
+                rec_i["area"] = new_area
+                rec_i["color"] = new_color
+                rec_i["color_min"] = new_cmin
+                rec_i["color_max"] = new_cmax
+                rec_i["merged_count"] += rec_j["merged_count"]
+
+                records.pop(j)
+                merged_in_inner = True
+                changed = True
+
+            if not merged_in_inner:
+                i += 1
+
+    # Rebuild shapes, shape_groups, and layerd_struct_masks in exact 1-to-1 order
+    new_shapes = []
+    new_shape_groups = []
+    new_layer_dict = {}
+
+    for idx, rec in enumerate(records):
+        lid = rec["layer_id"]
+        if lid not in new_layer_dict:
+            new_layer_dict[lid] = []
+
+        if rec["merged_count"] == 1:
+            orig_idx = rec["orig_idx"]
+            path = shapes[orig_idx]
+            orig_group = shape_groups[orig_idx]
+            group = pydiffvg.ShapeGroup(
+                shape_ids=torch.LongTensor([idx]),
+                fill_color=orig_group.fill_color.detach().clone(),
+                stroke_color=orig_group.stroke_color.detach().clone(),
+            )
+            mask_u8 = flat_masks[orig_idx]
+        else:
+            mask_u8 = np.where(rec["mask"], 255, 0).astype(np.uint8)
+            path = init_path_by_mask(mask_u8.copy(), epsilon=epsilon)
+            fill_rgb = [float(np.clip(c, 0.0, 1.0)) for c in rec["color"]]
+            group = pydiffvg.ShapeGroup(
+                shape_ids=torch.LongTensor([idx]),
+                fill_color=torch.FloatTensor(fill_rgb + [1.0]),
+                stroke_color=torch.FloatTensor([0.0, 0.0, 0.0, 1.0]),
+            )
+
+        new_shapes.append(path)
+        new_shape_groups.append(group)
+        new_layer_dict[lid].append(mask_u8)
+
+    new_layerd_struct_masks = [new_layer_dict[k] for k in sorted(new_layer_dict.keys()) if len(new_layer_dict[k]) > 0]
+    return new_shapes, new_shape_groups, new_layerd_struct_masks
+
+
 def simplify_concave_shapes(
     device,
     shapes: list,

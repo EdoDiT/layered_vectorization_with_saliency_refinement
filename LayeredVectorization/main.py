@@ -257,6 +257,21 @@ def layered_vectorization(args,device=None):
                                                   struct_svgs_save_path,
                                                   args.train,
                                                   args.base_lr)
+    if getattr(args, "is_merge_struct", True):
+        print("Structural Shape Merging...")
+        shapes,shape_groups,layerd_struct_masks = merge_struct_shapes(
+            device,
+            shapes,
+            shape_groups,
+            target_img,
+            layerd_struct_masks,
+            epsilon=args.approxpolydp_epsilon,
+            distance_threshold=getattr(args, "struct_merge_distance_threshold", 6),
+            color_range_pct=getattr(args, "struct_merge_color_range_pct", 0.13),
+            max_intervening_overlap=getattr(args, "struct_merge_max_intervening_overlap", 10),
+            min_contact_pixels=getattr(args, "struct_merge_min_contact_pixels", 4),
+        )
+        pydiffvg.save_svg(f"./workdir/{args.file_save_name}/struct_merged.svg",img_height,img_width,shapes,shape_groups)
     if getattr(args, "is_simplify_concave", True):
         print("Concave Simplification...")
         shapes,shape_groups = simplify_concave_shapes(
