@@ -12,6 +12,11 @@ paths_merge_color_threshold: 0.1
 paths_merge_distance_threshold: 3
 paths_remove_visual_threshold: 7.0
 
+# Concave simplification phase (before post-optimization color fitting)
+is_simplify_concave: True
+concave_mse_threshold: 0.0005
+concave_max_covered_pixels: 25
+
 # Perform kmeans clustering on target images to reduce color categories
 is_cluster_target_img: True
 kmeas_k: 80

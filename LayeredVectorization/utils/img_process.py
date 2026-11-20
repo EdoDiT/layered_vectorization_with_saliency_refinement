@@ -817,3 +817,266 @@ def remove_lowquality_paths(shapes, shape_groups,device,
     for i in range(len(shape_groups)):
         shape_groups[i].shape_ids=torch.tensor([i])
     return shapes,shape_groups
+
+
+def _get_path_orientation(points: torch.Tensor) -> float:
+    """Return +1.0 or -1.0 for the closed cubic Bezier path's winding, or 0.0 if degenerate."""
+    num_segs = points.shape[0] // 3
+    if num_segs < 3:
+        return 0.0
+    t_vals = torch.tensor([0.0, 0.25, 0.5, 0.75], device=points.device, dtype=points.dtype)
+    sampled = []
+    for k in range(num_segs):
+        p0 = points[3 * k]
+        c1 = points[3 * k + 1]
+        c2 = points[3 * k + 2]
+        p1 = points[(3 * ((k + 1) % num_segs))]
+        for t in t_vals:
+            omt = 1.0 - t
+            pt = (omt ** 3) * p0 + 3.0 * (omt ** 2) * t * c1 + 3.0 * omt * (t ** 2) * c2 + (t ** 3) * p1
+            sampled.append(pt)
+    poly = torch.stack(sampled, dim=0)
+    poly_next = torch.roll(poly, shifts=-1, dims=0)
+    signed_area = 0.5 * torch.sum(poly[:, 0] * poly_next[:, 1] - poly_next[:, 0] * poly[:, 1]).item()
+    if abs(signed_area) < 1e-6:
+        return 0.0
+    return 1.0 if signed_area > 0 else -1.0
+
+
+def _find_concave_vertices(points: torch.Tensor, orient: float, eps: float = 1e-3) -> List[int]:
+    """Return indices of anchor vertices that form a concave angle."""
+    num_segs = points.shape[0] // 3
+    concave = []
+    for k in range(num_segs):
+        prev_k = (k - 1) % num_segs
+        next_k = (k + 1) % num_segs
+        pk = points[3 * k]
+        v_in = pk - points[3 * prev_k + 2]
+        if torch.norm(v_in).item() < 1e-4:
+            v_in = pk - points[3 * prev_k]
+        v_out = points[3 * k + 1] - pk
+        if torch.norm(v_out).item() < 1e-4:
+            v_out = points[3 * next_k] - pk
+        n_in = torch.norm(v_in).item()
+        n_out = torch.norm(v_out).item()
+        if n_in < 1e-6 or n_out < 1e-6:
+            continue
+        v_in = v_in / n_in
+        v_out = v_out / n_out
+        cross_val = orient * (v_in[0] * v_out[1] - v_in[1] * v_out[0]).item()
+        if cross_val < -eps:
+            concave.append(k)
+    return concave
+
+
+def _is_segment_straight(
+    p0: torch.Tensor,
+    c1: torch.Tensor,
+    c2: torch.Tensor,
+    p1: torch.Tensor,
+    flat_tol: float = 0.5,
+) -> bool:
+    """Return True if both control points lie within flat_tol of the chord p0 -> p1."""
+    chord = p1 - p0
+    chord_len = torch.norm(chord).item()
+    if chord_len < 1e-4:
+        return True
+    chord_unit = chord / chord_len
+    d1 = abs((c1[0] - p0[0]) * chord_unit[1] - (c1[1] - p0[1]) * chord_unit[0]).item()
+    d2 = abs((c2[0] - p0[0]) * chord_unit[1] - (c2[1] - p0[1]) * chord_unit[0]).item()
+    return max(d1, d2) < flat_tol
+
+
+def _find_concave_segments(points: torch.Tensor, orient: float, flat_tol: float = 0.5, curv_eps: float = 1e-2) -> List[int]:
+    """Return indices of cubic Bezier segments that bend inward (concave)."""
+    num_segs = points.shape[0] // 3
+    concave = []
+    t_vals = [0.2, 0.4, 0.6, 0.8]
+    for k in range(num_segs):
+        p0 = points[3 * k]
+        c1 = points[3 * k + 1]
+        c2 = points[3 * k + 2]
+        p1 = points[3 * ((k + 1) % num_segs)]
+        if _is_segment_straight(p0, c1, c2, p1, flat_tol):
+            continue
+        min_curv = float("inf")
+        for t in t_vals:
+            omt = 1.0 - t
+            dp = 3.0 * (omt ** 2) * (c1 - p0) + 6.0 * omt * t * (c2 - c1) + 3.0 * (t ** 2) * (p1 - c2)
+            ddp = 6.0 * omt * (c2 - 2.0 * c1 + p0) + 6.0 * t * (p1 - 2.0 * c2 + c1)
+            curv_num = orient * (dp[0] * ddp[1] - dp[1] * ddp[0]).item()
+            if curv_num < min_curv:
+                min_curv = curv_num
+        if min_curv < -curv_eps:
+            concave.append(k)
+    return concave
+
+
+def _remove_vertex_harmonic(
+    path: pydiffvg.Path, k: int, flat_tol: float = 0.5, harmonic: bool = True
+) -> pydiffvg.Path:
+    """Remove anchor vertex k and bridge P_{k-1} -> P_{k+1} with harmonic or straight-chord Bezier handles."""
+    pts = path.points.detach().clone()
+    num_segs = pts.shape[0] // 3
+    prev_k = (k - 1) % num_segs
+    next_k = (k + 1) % num_segs
+    prev2_k = (k - 2) % num_segs
+    next2_k = (k + 2) % num_segs
+
+    p_prev = pts[3 * prev_k]
+    p_next = pts[3 * next_k]
+    chord = p_next - p_prev
+    chord_len = torch.norm(chord).item()
+
+    c2_other = pts[3 * prev2_k + 2]
+    prev_seg_curved = harmonic and not _is_segment_straight(
+        pts[3 * prev2_k], pts[3 * prev2_k + 1], c2_other, p_prev, flat_tol
+    )
+    u = p_prev - c2_other
+    u_len = torch.norm(u).item()
+    if prev_seg_curved and u_len > 1e-4 and chord_len > 1e-4:
+        c1_new = p_prev + (u / u_len) * min(u_len, chord_len / 3.0)
+    else:
+        c1_new = p_prev + chord / 3.0
+
+    c1_other = pts[3 * next_k + 1]
+    next_seg_curved = harmonic and not _is_segment_straight(
+        p_next, c1_other, pts[3 * next_k + 2], pts[3 * next2_k], flat_tol
+    )
+    v = p_next - c1_other
+    v_len = torch.norm(v).item()
+    if next_seg_curved and v_len > 1e-4 and chord_len > 1e-4:
+        c2_new = p_next + (v / v_len) * min(v_len, chord_len / 3.0)
+    else:
+        c2_new = p_next - chord / 3.0
+
+    pts[3 * prev_k + 1] = c1_new
+    pts[3 * k + 2] = c2_new
+
+    drop_indices = {3 * prev_k + 2, 3 * k, 3 * k + 1}
+    keep_mask = [idx for idx in range(pts.shape[0]) if idx not in drop_indices]
+    new_pts = pts[keep_mask]
+    if k == 0:
+        new_pts = torch.roll(new_pts, shifts=-1, dims=0)
+
+    new_num_ctrl = torch.full((num_segs - 1,), 2, dtype=path.num_control_points.dtype, device=path.num_control_points.device)
+    return pydiffvg.Path(
+        num_control_points=new_num_ctrl,
+        points=new_pts,
+        stroke_width=path.stroke_width.detach().clone(),
+        is_closed=path.is_closed,
+    )
+
+
+def _straighten_segment(path: pydiffvg.Path, k: int) -> pydiffvg.Path:
+    """Straighten cubic Bezier segment k into a line between its endpoints."""
+    pts = path.points.detach().clone()
+    num_segs = pts.shape[0] // 3
+    p0 = pts[3 * k]
+    p1 = pts[3 * ((k + 1) % num_segs)]
+    pts[3 * k + 1] = p0 + (p1 - p0) / 3.0
+    pts[3 * k + 2] = p0 + 2.0 * (p1 - p0) / 3.0
+    return pydiffvg.Path(
+        num_control_points=path.num_control_points.detach().clone(),
+        points=pts,
+        stroke_width=path.stroke_width.detach().clone(),
+        is_closed=path.is_closed,
+    )
+
+
+def _render_alpha_mask(width: int, height: int, shapes_subset: list, device) -> torch.Tensor:
+    """Render a subset of shapes into a boolean coverage mask (H, W)."""
+    if len(shapes_subset) == 0:
+        return torch.zeros((height, width), dtype=torch.bool, device=device)
+    white_groups = [
+        pydiffvg.ShapeGroup(
+            shape_ids=torch.LongTensor([idx]),
+            fill_color=torch.FloatTensor([1.0, 1.0, 1.0, 1.0]),
+            stroke_color=torch.FloatTensor([0.0, 0.0, 0.0, 0.0]),
+        )
+        for idx in range(len(shapes_subset))
+    ]
+    rendered = svg_to_img(width, height, shapes_subset, white_groups, device)
+    return rendered[:, :, 3] > 0.5
+
+
+def simplify_concave_shapes(
+    device,
+    shapes: list,
+    shape_groups: list,
+    target_img: np.ndarray,
+    mse_threshold: float = 0.0005,
+    max_covered_pixels: int = 25,
+):
+    """Bottom-to-top pass removing concave angles/curves that neither hurt target similarity nor cover visible lower shapes."""
+    img_height, img_width = target_img.shape[:2]
+    target_tensor = (torch.tensor(target_img, device=device, dtype=torch.float32) / 255.0).permute(2, 0, 1)
+
+    with torch.no_grad():
+        curr_img = rgba_to_rgb(svg_to_img(img_width, img_height, shapes, shape_groups, device), device)
+        curr_mse = torch.nn.functional.mse_loss(curr_img, target_tensor).item()
+
+        for i in tqdm(range(len(shapes)), desc="Concave simplification", unit="shape"):
+            if i == 0:
+                visible_lower = torch.zeros((img_height, img_width), dtype=torch.bool, device=device)
+            else:
+                lower_alpha = _render_alpha_mask(img_width, img_height, shapes[:i], device)
+                upper_alpha = _render_alpha_mask(img_width, img_height, shapes[i + 1 :], device)
+                curr_shape_alpha = _render_alpha_mask(img_width, img_height, [shapes[i]], device)
+                visible_lower = lower_alpha & (~curr_shape_alpha) & (~upper_alpha)
+
+            def _accept_best(candidates: List[pydiffvg.Path]) -> bool:
+                nonlocal curr_mse, visible_lower
+                best = None
+                for cand_path in candidates:
+                    cand_alpha = _render_alpha_mask(img_width, img_height, [cand_path], device)
+                    newly_covered = int(torch.sum(visible_lower & cand_alpha).item())
+                    if newly_covered > max_covered_pixels:
+                        continue
+
+                    shapes_cand = shapes[:i] + [cand_path] + shapes[i + 1 :]
+                    cand_img = rgba_to_rgb(svg_to_img(img_width, img_height, shapes_cand, shape_groups, device), device)
+                    cand_mse = torch.nn.functional.mse_loss(cand_img, target_tensor).item()
+                    if (cand_mse - curr_mse) > mse_threshold:
+                        continue
+
+                    if best is None or cand_mse < best[0]:
+                        best = (cand_mse, cand_path, cand_alpha)
+
+                if best is None:
+                    return False
+
+                curr_mse, shapes[i], best_alpha = best
+                visible_lower = visible_lower & (~best_alpha)
+                return True
+
+            changed = True
+            while changed:
+                changed = False
+                pts = shapes[i].points.detach()
+                orient = _get_path_orientation(pts)
+                if orient == 0.0:
+                    break
+
+                num_segs = pts.shape[0] // 3
+                if num_segs > 3:
+                    for k in _find_concave_vertices(pts, orient):
+                        cand_harmonic = _remove_vertex_harmonic(shapes[i], k, harmonic=True)
+                        cand_straight = _remove_vertex_harmonic(shapes[i], k, harmonic=False)
+                        candidates = (
+                            [cand_harmonic]
+                            if torch.allclose(cand_harmonic.points, cand_straight.points, atol=1e-4)
+                            else [cand_harmonic, cand_straight]
+                        )
+                        if _accept_best(candidates):
+                            changed = True
+                            break
+                    if changed:
+                        continue
+
+                for k in _find_concave_segments(pts, orient):
+                    if _accept_best([_straighten_segment(shapes[i], k)]):
+                        changed = True
+                        break
+
+    return shapes, shape_groups

@@ -257,6 +257,17 @@ def layered_vectorization(args,device=None):
                                                   struct_svgs_save_path,
                                                   args.train,
                                                   args.base_lr)
+    if getattr(args, "is_simplify_concave", True):
+        print("Concave Simplification...")
+        shapes,shape_groups = simplify_concave_shapes(
+            device,
+            shapes,
+            shape_groups,
+            target_img,
+            mse_threshold=getattr(args, "concave_mse_threshold", 0.0005),
+            max_covered_pixels=getattr(args, "concave_max_covered_pixels", 25),
+        )
+        pydiffvg.save_svg(f"./workdir/{args.file_save_name}/concave_simplified.svg",img_height,img_width,shapes,shape_groups)
     if args.color_fitting_type not in ["dominan","mse"]:
         raise ValueError(f"args.color_fitting_type can only be 'dominan' or 'mse', but the values passed in are {args.color_fitting_type}")
     if args.color_fitting_type == "dominan":
