@@ -257,7 +257,7 @@ def layered_vectorization(args,device=None):
                                                   struct_svgs_save_path,
                                                   args.train,
                                                   args.base_lr)
-    if getattr(args, "is_merge_struct", True):
+    if getattr(args, "is_merge_struct", False):
         print("Structural Shape Merging...")
         shapes,shape_groups,layerd_struct_masks = merge_struct_shapes(
             device,
