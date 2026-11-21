@@ -844,19 +844,15 @@ def _get_path_orientation(points: torch.Tensor) -> float:
 
 
 def _find_concave_vertices(points: torch.Tensor, orient: float, eps: float = 1e-3) -> List[int]:
-    """Return indices of anchor vertices that form a concave angle."""
+    """Return indices of anchor vertices that form a concave angle based on anchor chords."""
     num_segs = points.shape[0] // 3
     concave = []
     for k in range(num_segs):
         prev_k = (k - 1) % num_segs
         next_k = (k + 1) % num_segs
         pk = points[3 * k]
-        v_in = pk - points[3 * prev_k + 2]
-        if torch.norm(v_in).item() < 1e-4:
-            v_in = pk - points[3 * prev_k]
-        v_out = points[3 * k + 1] - pk
-        if torch.norm(v_out).item() < 1e-4:
-            v_out = points[3 * next_k] - pk
+        v_in = pk - points[3 * prev_k]
+        v_out = points[3 * next_k] - pk
         n_in = torch.norm(v_in).item()
         n_out = torch.norm(v_out).item()
         if n_in < 1e-6 or n_out < 1e-6:
