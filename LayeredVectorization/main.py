@@ -279,8 +279,7 @@ def layered_vectorization(args,device=None):
             shapes,
             shape_groups,
             target_img,
-            mse_threshold=getattr(args, "concave_mse_threshold", 0.0005),
-            max_covered_pixels=getattr(args, "concave_max_covered_pixels", 25),
+            sse_threshold=getattr(args, "concave_sse_threshold", 3.0),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/concave_simplified.svg",img_height,img_width,shapes,shape_groups)
     if args.color_fitting_type not in ["dominan","mse"]:

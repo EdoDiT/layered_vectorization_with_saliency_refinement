@@ -1279,49 +1279,34 @@ def simplify_concave_shapes(
     shapes: list,
     shape_groups: list,
     target_img: np.ndarray,
-    mse_threshold: float = 0.0005,
-    max_covered_pixels: int = 25,
+    sse_threshold: float = 3.0,
 ):
-    """Bottom-to-top pass removing concave angles/curves that neither hurt target similarity nor cover visible lower shapes."""
+    """Bottom-to-top pass removing concave angles/curves that do not degrade summed squared error against target_img."""
     img_height, img_width = target_img.shape[:2]
     target_tensor = (torch.tensor(target_img, device=device, dtype=torch.float32) / 255.0).permute(2, 0, 1)
 
     with torch.no_grad():
         curr_img = rgba_to_rgb(svg_to_img(img_width, img_height, shapes, shape_groups, device), device)
-        curr_mse = torch.nn.functional.mse_loss(curr_img, target_tensor).item()
+        curr_sse = torch.nn.functional.mse_loss(curr_img, target_tensor, reduction="sum").item()
 
         for i in tqdm(range(len(shapes)), desc="Concave simplification", unit="shape"):
-            if i == 0:
-                visible_lower = torch.zeros((img_height, img_width), dtype=torch.bool, device=device)
-            else:
-                lower_alpha = _render_alpha_mask(img_width, img_height, shapes[:i], device)
-                upper_alpha = _render_alpha_mask(img_width, img_height, shapes[i + 1 :], device)
-                curr_shape_alpha = _render_alpha_mask(img_width, img_height, [shapes[i]], device)
-                visible_lower = lower_alpha & (~curr_shape_alpha) & (~upper_alpha)
-
             def _accept_best(candidates: List[pydiffvg.Path]) -> bool:
-                nonlocal curr_mse, visible_lower
+                nonlocal curr_sse
                 best = None
                 for cand_path in candidates:
-                    cand_alpha = _render_alpha_mask(img_width, img_height, [cand_path], device)
-                    newly_covered = int(torch.sum(visible_lower & cand_alpha).item())
-                    if newly_covered > max_covered_pixels:
-                        continue
-
                     shapes_cand = shapes[:i] + [cand_path] + shapes[i + 1 :]
                     cand_img = rgba_to_rgb(svg_to_img(img_width, img_height, shapes_cand, shape_groups, device), device)
-                    cand_mse = torch.nn.functional.mse_loss(cand_img, target_tensor).item()
-                    if (cand_mse - curr_mse) > mse_threshold:
+                    cand_sse = torch.nn.functional.mse_loss(cand_img, target_tensor, reduction="sum").item()
+                    if (cand_sse - curr_sse) > sse_threshold:
                         continue
 
-                    if best is None or cand_mse < best[0]:
-                        best = (cand_mse, cand_path, cand_alpha)
+                    if best is None or cand_sse < best[0]:
+                        best = (cand_sse, cand_path)
 
                 if best is None:
                     return False
 
-                curr_mse, shapes[i], best_alpha = best
-                visible_lower = visible_lower & (~best_alpha)
+                curr_sse, shapes[i] = best
                 return True
 
             changed = True
