@@ -12,16 +12,16 @@ paths_merge_color_threshold: 0.1
 paths_merge_distance_threshold: 3
 paths_remove_visual_threshold: 7.0
 
-# Structural shape merging phase (after structural optimization, before concave simplification)
-is_merge_struct: False
-struct_merge_distance_threshold: 6
-struct_merge_color_range_pct: 0.13
-struct_merge_max_intervening_overlap: 10
-struct_merge_min_contact_pixels: 4
-
-# Concave simplification phase (before post-optimization color fitting)
+# Concave simplification phase (after structural optimization)
 is_simplify_concave: True
 concave_sse_threshold: 3.0
+
+# Structural shape merging phase (after concave simplification, before color fitting)
+is_merge_struct: True
+struct_merge_distance_threshold: 60.0
+struct_merge_max_stack_gap: 50
+struct_merge_color_range_pct: 0.13
+struct_merge_sse_threshold: 25.0
 
 # Perform kmeans clustering on target images to reduce color categories
 is_cluster_target_img: True
