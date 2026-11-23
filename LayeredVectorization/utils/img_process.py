@@ -1207,51 +1207,6 @@ def _generate_convex_bridge_candidates(path1: pydiffvg.Path, path2: pydiffvg.Pat
     return candidates
 
 
-def _are_colors_similar(
-    c_i: np.ndarray,
-    c_j: np.ndarray,
-    cmin_i: np.ndarray,
-    cmax_i: np.ndarray,
-    cmin_j: np.ndarray,
-    cmax_j: np.ndarray,
-    channel_thresholds: np.ndarray,
-) -> bool:
-    """
-    Check per-channel dynamic-range similarity, mean normalized difference,
-    inter-channel chromaticity balance (R-G, G-B, R-B), and non-drifting cluster bounds.
-    """
-    diff = np.abs(c_i - c_j)
-    if np.any(diff > channel_thresholds):
-        return False
-
-    # Require mean normalized difference across channels <= 0.85 of threshold
-    if float(np.mean(diff / np.maximum(channel_thresholds, 1e-4))) > 0.85:
-        return False
-
-    # Chromaticity vector (hue & saturation) consistency: c_tilde = c - mean(c)
-    chroma_i = c_i - float(np.mean(c_i))
-    chroma_j = c_j - float(np.mean(c_j))
-    norm_i = float(np.linalg.norm(chroma_i))
-    norm_j = float(np.linalg.norm(chroma_j))
-    max_norm = max(norm_i, norm_j)
-    min_norm = min(norm_i, norm_j)
-
-    if max_norm > 0.045:
-        # Do not merge a distinctly chromatic (colored) shape with a nearly achromatic (neutral grey) shape
-        if min_norm < 0.022 or (min_norm / max_norm) < 0.35:
-            return False
-        cos_sim = float(np.dot(chroma_i, chroma_j)) / (norm_i * norm_j + 1e-8)
-        if cos_sim < 0.85:
-            return False
-
-    # Prevent cumulative color drift across chained merges
-    span = np.maximum(cmax_i, cmax_j) - np.minimum(cmin_i, cmin_j)
-    if np.any(span > 1.25 * channel_thresholds):
-        return False
-
-    return True
-
-
 def merge_struct_shapes(
     device,
     shapes: list,
@@ -1259,16 +1214,18 @@ def merge_struct_shapes(
     target_img: np.ndarray,
     layerd_struct_masks: list = None,
     distance_threshold: float = 60.0,
-    max_stack_gap: int = 180,
-    color_range_pct: float = 0.085,
-    sse_threshold: float = 8.0,
+    max_stack_gap_pct: float = 0.20,
+    color_range_pct: float = 0.05,
+    max_area_change_pct: float = 0.10,
+    sse_threshold: float = 25.0,
 ):
     """
-    Merge structural shapes that are spatially close or overlapping, within max_stack_gap in the
-    layer stack, and have very similar colors (both per-channel and chromatic balance).
-    Merged shapes are bridged via their outer convex-hull common tangents, placed low enough in
-    the layer stack so all foreground objects in the bridged gap remain on top of the merged shape,
-    and reverted if the rendered SSE against target_img increases by more than sse_threshold.
+    Merge structural shapes that are spatially close or overlapping, within a stack gap
+    proportional to the total number of shapes (max_stack_gap_pct * len(shapes)), and have
+    very similar colors.
+    Merged shapes are bridged via their outer convex-hull common tangents, placed at the lower
+    stack index of the two shapes with an area-weighted average color, and rejected if the fraction
+    of area that changes color exceeds max_area_change_pct (or if SSE degrades beyond sse_threshold).
     """
     flat_masks = []
     flat_layer_ids = []
@@ -1281,6 +1238,8 @@ def merge_struct_shapes(
     has_valid_masks = (layerd_struct_masks is not None) and (len(flat_masks) == len(shapes))
     if len(shapes) <= 2:
         return shapes, shape_groups, layerd_struct_masks
+
+    max_stack_gap = max(1, int(round(max_stack_gap_pct * len(shapes))))
 
     img_height, img_width = target_img.shape[:2]
     target_float = target_img.astype(np.float32) / 255.0
@@ -1301,17 +1260,12 @@ def merge_struct_shapes(
         alphas = []
         areas = []
         sampled_curves = []
-        color_mins = []
-        color_maxs = []
-        for i, shape in enumerate(shapes):
+        for shape in shapes:
             alpha = _render_alpha_mask(img_width, img_height, [shape], device)
             area = max(int(torch.sum(alpha).item()), 1)
             alphas.append(alpha)
             areas.append(area)
             sampled_curves.append(_sample_bezier_points(shape.points))
-            c_init = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
-            color_mins.append(c_init.copy())
-            color_maxs.append(c_init.copy())
 
         # Keep index 0 (full-canvas background) intact; iteratively merge shapes 1..N-1
         changed = True
@@ -1325,10 +1279,8 @@ def merge_struct_shapes(
                     c_i = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
                     c_j = np.clip(shape_groups[j].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
 
-                    # 1. Contrast-aware per-channel & chromatic color similarity
-                    if not _are_colors_similar(
-                        c_i, c_j, color_mins[i], color_maxs[i], color_mins[j], color_maxs[j], channel_thresholds
-                    ):
+                    # 1. Contrast-aware per-channel color similarity
+                    if np.any(np.abs(c_i - c_j) > channel_thresholds):
                         j += 1
                         continue
 
@@ -1349,124 +1301,96 @@ def merge_struct_shapes(
                         j += 1
                         continue
 
+                    # Visible area of shapes i and j before merging
+                    upper_j = torch.zeros((img_height, img_width), dtype=torch.bool, device=device)
+                    for k in range(j + 1, len(shapes)):
+                        upper_j = upper_j | alphas[k]
+                    upper_i = upper_j | alphas[j]
+                    for k in range(i + 1, j):
+                        upper_i = upper_i | alphas[k]
+                    vis_i = alphas[i] & (~upper_i)
+                    vis_j = alphas[j] & (~upper_j)
+                    vis_area = int(torch.sum(vis_i | vis_j).item())
+                    if vis_area <= 0:
+                        j += 1
+                        continue
+
                     # Area-weighted fill color
                     w_i, w_j = areas[i], areas[j]
                     merged_rgb = (w_i * c_i + w_j * c_j) / float(w_i + w_j)
                     merged_fill = torch.FloatTensor(
                         [float(merged_rgb[0]), float(merged_rgb[1]), float(merged_rgb[2]), 1.0]
                     )
+                    own_shift = float(max(np.max(np.abs(c_i - merged_rgb)), np.max(np.abs(c_j - merged_rgb))))
 
-                    # Find common parent background layers k < i that enclose both shapes i and j
-                    min_valid_pos = 1
-                    for k in range(1, i):
-                        if areas[k] > (w_i + w_j):
-                            ov_i = int(torch.sum(alphas[i] & alphas[k]).item())
-                            ov_j = int(torch.sum(alphas[j] & alphas[k]).item())
-                            if ov_i > 0.6 * w_i and ov_j > 0.6 * w_j:
-                                min_valid_pos = k + 1
-
-                    # 4. Evaluate each candidate placed below all gap/sibling shapes k in [min_valid_pos .. i-1]
+                    # 4. Evaluate candidates placed at the lower stack index i
                     best_cand = None
                     for cand_path in candidates:
-                        cand_alpha = _render_alpha_mask(img_width, img_height, [cand_path], device)
-                        cand_area = max(int(torch.sum(cand_alpha).item()), 1)
-
-                        # Place merged shape below any non-parent shape k < i that cand_alpha overlaps
-                        target_pos = i
-                        for k in range(min_valid_pos, i):
-                            if int(torch.sum(cand_alpha & alphas[k]).item()) > 2:
-                                target_pos = k
-                                break
-
-                        # Test placing at target_pos (and also min_valid_pos if different)
-                        candidate_positions = [target_pos]
-                        if min_valid_pos < target_pos:
-                            candidate_positions.append(min_valid_pos)
-
-                        for pos in candidate_positions:
-                            shapes_cand = (
-                                shapes[:pos]
-                                + [cand_path]
-                                + shapes[pos:i]
-                                + shapes[i + 1 : j]
-                                + shapes[j + 1 :]
-                            )
-                            groups_prev = (
-                                shape_groups[:pos]
-                                + [None]
-                                + shape_groups[pos:i]
-                                + shape_groups[i + 1 : j]
-                                + shape_groups[j + 1 :]
-                            )
-                            groups_cand = []
-                            for k_idx, src_g in enumerate(groups_prev):
-                                if k_idx == pos:
-                                    fill_c = merged_fill
-                                    stroke_c = shape_groups[i].stroke_color
-                                else:
-                                    fill_c = src_g.fill_color
-                                    stroke_c = src_g.stroke_color
-                                groups_cand.append(
-                                    pydiffvg.ShapeGroup(
-                                        shape_ids=torch.LongTensor([k_idx]),
-                                        fill_color=fill_c,
-                                        stroke_color=stroke_c,
-                                    )
+                        shapes_cand = shapes[:i] + [cand_path] + shapes[i + 1 : j] + shapes[j + 1 :]
+                        groups_prev = shape_groups[:i] + [None] + shape_groups[i + 1 : j] + shape_groups[j + 1 :]
+                        groups_cand = []
+                        for k_idx, src_g in enumerate(groups_prev):
+                            if k_idx == i:
+                                fill_c = merged_fill
+                                stroke_c = shape_groups[i].stroke_color
+                            else:
+                                fill_c = src_g.fill_color
+                                stroke_c = src_g.stroke_color
+                            groups_cand.append(
+                                pydiffvg.ShapeGroup(
+                                    shape_ids=torch.LongTensor([k_idx]),
+                                    fill_color=fill_c,
+                                    stroke_color=stroke_c,
                                 )
-
-                            cand_img = rgba_to_rgb(
-                                svg_to_img(img_width, img_height, shapes_cand, groups_cand, device), device
                             )
-                            cand_sse = torch.nn.functional.mse_loss(cand_img, target_tensor, reduction="sum").item()
-                            if (cand_sse - curr_sse) > sse_threshold:
-                                continue
-                            if best_cand is None or cand_sse < best_cand[0]:
-                                best_cand = (
-                                    cand_sse,
-                                    cand_path,
-                                    cand_alpha,
-                                    cand_area,
-                                    pos,
-                                    shapes_cand,
-                                    groups_cand,
-                                )
+
+                        cand_img = rgba_to_rgb(
+                            svg_to_img(img_width, img_height, shapes_cand, groups_cand, device), device
+                        )
+                        px_diff = torch.max(torch.abs(cand_img - curr_img), dim=0)[0]
+                        changed_area = int(torch.sum(px_diff > (own_shift + 1e-3)).item())
+                        change_frac = changed_area / float(vis_area)
+                        if change_frac > max_area_change_pct:
+                            continue
+
+                        cand_sse = torch.nn.functional.mse_loss(cand_img, target_tensor, reduction="sum").item()
+                        if (cand_sse - curr_sse) > sse_threshold:
+                            continue
+
+                        if best_cand is None or change_frac < best_cand[0]:
+                            cand_alpha = _render_alpha_mask(img_width, img_height, [cand_path], device)
+                            cand_area = max(int(torch.sum(cand_alpha).item()), 1)
+                            best_cand = (
+                                change_frac,
+                                cand_sse,
+                                cand_img,
+                                cand_path,
+                                cand_alpha,
+                                cand_area,
+                                shapes_cand,
+                                groups_cand,
+                            )
 
                     if best_cand is None:
                         j += 1
                         continue
 
-                    # Accept merge at pos <= i and remove original i and j
-                    curr_sse, accepted_path, acc_alpha, acc_area, pos, shapes, shape_groups = best_cand
-                    new_cmin = np.minimum(color_mins[i], color_mins[j])
-                    new_cmax = np.maximum(color_maxs[i], color_maxs[j])
-                    new_sampled = _sample_bezier_points(accepted_path.points)
-
-                    # Remove j then i, and insert at pos
-                    for lst, new_val in (
-                        (alphas, acc_alpha),
-                        (areas, acc_area),
-                        (sampled_curves, new_sampled),
-                        (color_mins, new_cmin),
-                        (color_maxs, new_cmax),
-                    ):
-                        lst.pop(j)
-                        lst.pop(i)
-                        lst.insert(pos, new_val)
+                    # Accept merge at position i and remove j
+                    _, curr_sse, curr_img, accepted_path, acc_alpha, acc_area, shapes, shape_groups = best_cand
+                    alphas[i] = acc_alpha
+                    areas[i] = acc_area
+                    sampled_curves[i] = _sample_bezier_points(accepted_path.points)
+                    alphas.pop(j)
+                    areas.pop(j)
+                    sampled_curves.pop(j)
 
                     if has_valid_masks:
-                        merged_mask_u8 = np.maximum(flat_masks[i], flat_masks[j])
+                        flat_masks[i] = np.maximum(flat_masks[i], flat_masks[j])
                         flat_masks.pop(j)
-                        flat_masks.pop(i)
-                        flat_masks.insert(pos, merged_mask_u8)
-                        target_lid = flat_layer_ids[pos] if pos < len(flat_layer_ids) else flat_layer_ids[i]
                         flat_layer_ids.pop(j)
-                        flat_layer_ids.pop(i)
-                        flat_layer_ids.insert(pos, target_lid)
 
                     merged_any = True
                     changed = True
-                    # If pos < i, restart scan from pos so the newly lowered shape can merge with further shapes
-                    i = pos
                     break
 
                 if not merged_any:

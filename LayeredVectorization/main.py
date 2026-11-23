@@ -277,9 +277,10 @@ def layered_vectorization(args,device=None):
             target_img,
             layerd_struct_masks,
             distance_threshold=getattr(args, "struct_merge_distance_threshold", 60.0),
-            max_stack_gap=getattr(args, "struct_merge_max_stack_gap", 180),
-            color_range_pct=getattr(args, "struct_merge_color_range_pct", 0.085),
-            sse_threshold=getattr(args, "struct_merge_sse_threshold", 8.0),
+            max_stack_gap_pct=getattr(args, "struct_merge_max_stack_gap_pct", 0.20),
+            color_range_pct=getattr(args, "struct_merge_color_range_pct", 0.05),
+            max_area_change_pct=getattr(args, "struct_merge_max_area_change_pct", 0.10),
+            sse_threshold=getattr(args, "struct_merge_sse_threshold", 25.0),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/struct_merged.svg",img_height,img_width,shapes,shape_groups)
     if args.color_fitting_type not in ["dominan","mse"]:
