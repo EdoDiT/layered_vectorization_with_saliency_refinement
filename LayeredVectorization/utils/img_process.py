@@ -1059,58 +1059,76 @@ def _convex_hull_indices(pts: np.ndarray, orient: float) -> List[int]:
     return hull
 
 
-def _build_spliced_bezier_path(
+def _extract_cyclic_hull_runs(hull_tags: list) -> list:
+    """Group cyclic [(shape_id, anchor_idx), ...] into maximal contiguous runs [(shape_id, start_idx, end_idx), ...]."""
+    if not hull_tags:
+        return []
+    m = len(hull_tags)
+    first_diff = 0
+    for k in range(m):
+        if hull_tags[k][0] != hull_tags[(k - 1) % m][0]:
+            first_diff = k
+            break
+    rot = hull_tags[first_diff:] + hull_tags[:first_diff]
+    runs = []
+    curr_s, start_idx = rot[0]
+    end_idx = start_idx
+    for s, idx in rot[1:]:
+        if s == curr_s:
+            end_idx = idx
+        else:
+            runs.append((curr_s, start_idx, end_idx))
+            curr_s = s
+            start_idx = idx
+            end_idx = idx
+    runs.append((curr_s, start_idx, end_idx))
+    return runs
+
+
+def _build_spliced_bezier_path_from_runs(
     pts1: torch.Tensor,
     pts2: torch.Tensor,
-    u_in: int,
-    u_out: int,
-    v_in: int,
-    v_out: int,
+    runs: list,
     stroke_width: torch.Tensor,
     is_closed: bool,
 ) -> pydiffvg.Path:
     """
-    Splice two closed cubic Bezier paths by keeping segments [u_in .. u_out) of pts1,
-    bridging A_{u_out} -> B_{v_in}, keeping segments [v_in .. v_out) of pts2,
-    and bridging B_{v_out} -> A_{u_in}.
+    Splice two closed cubic Bezier paths along cyclic hull runs [(shape_id, start_idx, end_idx), ...],
+    keeping each shape's original Bezier segments within each run and bridging transitions with straight chords.
     """
     n1 = pts1.shape[0] // 3
     n2 = pts2.shape[0] // 3
     seg_triples = []
+    num_runs = len(runs)
 
-    # 1. Kept outer arc of path 1: segments u_in, (u_in+1)%n1, ..., (u_out-1)%n1
-    u = u_in % n1
-    steps1 = (u_out - u_in) % n1
-    for _ in range(steps1):
-        seg_triples.append(pts1[3 * u : 3 * u + 3])
-        u = (u + 1) % n1
+    for r_idx in range(num_runs):
+        s_id, start_idx, end_idx = runs[r_idx]
+        next_s_id, next_start_idx, _ = runs[(r_idx + 1) % num_runs]
 
-    # 2. Bridge 1: A_{u_out} -> B_{v_in}
-    p_start1 = pts1[3 * (u_out % n1)]
-    p_end1 = pts2[3 * (v_in % n2)]
-    chord1 = p_end1 - p_start1
-    bridge1 = torch.stack([p_start1, p_start1 + chord1 / 3.0, p_start1 + 2.0 * chord1 / 3.0], dim=0)
-    seg_triples.append(bridge1)
+        curr_pts = pts1 if s_id == 1 else pts2
+        curr_n = n1 if s_id == 1 else n2
+        next_pts = pts1 if next_s_id == 1 else pts2
+        next_n = n1 if next_s_id == 1 else n2
 
-    # 3. Kept outer arc of path 2: segments v_in, (v_in+1)%n2, ..., (v_out-1)%n2
-    v = v_in % n2
-    steps2 = (v_out - v_in) % n2
-    for _ in range(steps2):
-        seg_triples.append(pts2[3 * v : 3 * v + 3])
-        v = (v + 1) % n2
+        u = start_idx % curr_n
+        steps = (end_idx - start_idx) % curr_n
+        for _ in range(steps):
+            seg_triples.append(curr_pts[3 * u : 3 * u + 3])
+            u = (u + 1) % curr_n
 
-    # 4. Bridge 2: B_{v_out} -> A_{u_in}
-    p_start2 = pts2[3 * (v_out % n2)]
-    p_end2 = pts1[3 * (u_in % n1)]
-    chord2 = p_end2 - p_start2
-    bridge2 = torch.stack([p_start2, p_start2 + chord2 / 3.0, p_start2 + 2.0 * chord2 / 3.0], dim=0)
-    seg_triples.append(bridge2)
+        p_start = curr_pts[3 * (end_idx % curr_n)]
+        p_end = next_pts[3 * (next_start_idx % next_n)]
+        chord = p_end - p_start
+        if torch.norm(chord).item() > 1e-4:
+            bridge = torch.stack([p_start, p_start + chord / 3.0, p_start + 2.0 * chord / 3.0], dim=0)
+            seg_triples.append(bridge)
+
+    if len(seg_triples) < 3:
+        return None
 
     new_pts = torch.cat(seg_triples, dim=0)
     num_new_segs = new_pts.shape[0] // 3
-    new_num_ctrl = torch.full(
-        (num_new_segs,), 2, dtype=torch.long, device=pts1.device
-    )
+    new_num_ctrl = torch.full((num_new_segs,), 2, dtype=torch.long, device=pts1.device)
     return pydiffvg.Path(
         num_control_points=new_num_ctrl,
         points=new_pts,
@@ -1141,22 +1159,20 @@ def _generate_convex_bridge_candidates(path1: pydiffvg.Path, path2: pydiffvg.Pat
     anchors1 = pts1[0::3].cpu().numpy()
     anchors2 = pts2[0::3].cpu().numpy()
 
-    # Closest anchor pair (u_star, v_star)
     dists = cdist(anchors1, anchors2)
     u_star, v_star = np.unravel_index(int(np.argmin(dists)), dists.shape)
     u_star, v_star = int(u_star), int(v_star)
 
     candidates = []
-    seen_pairs = set()
+    seen_runs = set()
 
-    # Test both local facing-window convex bridges and global convex hull bridges
-    window_Configs = [
+    window_configs = [
         (max(1, n1 // 4), max(1, n2 // 4)),
         (max(1, n1 // 3), max(1, n2 // 3)),
         (n1, n2),  # global hull
     ]
 
-    for h1, h2 in window_Configs:
+    for h1, h2 in window_configs:
         if h1 >= n1:
             idx1 = list(range(n1))
         else:
@@ -1170,46 +1186,70 @@ def _generate_convex_bridge_candidates(path1: pydiffvg.Path, path2: pydiffvg.Pat
         hull = _convex_hull_indices(sub_pts, orient1)
         len1 = len(idx1)
         hull_tags = [(1, idx1[h]) if h < len1 else (2, idx2[h - len1]) for h in hull]
+        runs = _extract_cyclic_hull_runs(hull_tags)
 
-        has_s1 = any(t[0] == 1 for t in hull_tags)
-        has_s2 = any(t[0] == 2 for t in hull_tags)
-
-        if h1 >= n1 and h2 >= n2:
-            if has_s1 and not has_s2:
-                candidates.append(path1)
-                continue
-            if has_s2 and not has_s1:
-                candidates.append(path2)
-                continue
-
-        if not (has_s1 and has_s2):
+        if len(runs) == 1:
+            if h1 >= n1 and h2 >= n2:
+                candidates.append(path1 if runs[0][0] == 1 else path2)
             continue
 
-        # Find transitions 1 -> 2 (u_out -> v_in) and 2 -> 1 (v_out -> u_in) on the hull
-        m = len(hull_tags)
-        trans_12 = []
-        trans_21 = []
-        for k in range(m):
-            curr_shape, curr_idx = hull_tags[k]
-            next_shape, next_idx = hull_tags[(k + 1) % m]
-            if curr_shape == 1 and next_shape == 2:
-                trans_12.append((curr_idx, next_idx))
-            elif curr_shape == 2 and next_shape == 1:
-                trans_21.append((curr_idx, next_idx))
-
-        if len(trans_12) == 1 and len(trans_21) == 1:
-            u_out, v_in = trans_12[0]
-            v_out, u_in = trans_21[0]
-            key = (u_in, u_out, v_in, v_out)
-            if key not in seen_pairs:
-                seen_pairs.add(key)
-                cand = _build_spliced_bezier_path(
-                    pts1, pts2, u_in, u_out, v_in, v_out, path1.stroke_width, path1.is_closed
+        # For local windows only use clean 2-run bridges; for global hull allow multi-run envelope too
+        if len(runs) == 2 or (h1 >= n1 and h2 >= n2 and len(runs) <= 6):
+            runs_key = tuple(runs)
+            if runs_key not in seen_runs:
+                seen_runs.add(runs_key)
+                cand = _build_spliced_bezier_path_from_runs(
+                    pts1, pts2, runs, path1.stroke_width, path1.is_closed
                 )
-                if (cand.points.shape[0] // 3) >= 3:
+                if cand is not None and (cand.points.shape[0] // 3) >= 3:
                     candidates.append(cand)
 
     return candidates
+
+
+def _are_colors_similar(
+    c_i: np.ndarray,
+    c_j: np.ndarray,
+    cmin_i: np.ndarray,
+    cmax_i: np.ndarray,
+    cmin_j: np.ndarray,
+    cmax_j: np.ndarray,
+    channel_thresholds: np.ndarray,
+) -> bool:
+    """
+    Check per-channel dynamic-range similarity, mean normalized difference,
+    inter-channel chromaticity balance (R-G, G-B, R-B), and non-drifting cluster bounds.
+    """
+    diff = np.abs(c_i - c_j)
+    if np.any(diff > channel_thresholds):
+        return False
+
+    # Require mean normalized difference across channels <= 0.85 of threshold
+    if float(np.mean(diff / np.maximum(channel_thresholds, 1e-4))) > 0.85:
+        return False
+
+    # Chromaticity vector (hue & saturation) consistency: c_tilde = c - mean(c)
+    chroma_i = c_i - float(np.mean(c_i))
+    chroma_j = c_j - float(np.mean(c_j))
+    norm_i = float(np.linalg.norm(chroma_i))
+    norm_j = float(np.linalg.norm(chroma_j))
+    max_norm = max(norm_i, norm_j)
+    min_norm = min(norm_i, norm_j)
+
+    if max_norm > 0.045:
+        # Do not merge a distinctly chromatic (colored) shape with a nearly achromatic (neutral grey) shape
+        if min_norm < 0.022 or (min_norm / max_norm) < 0.35:
+            return False
+        cos_sim = float(np.dot(chroma_i, chroma_j)) / (norm_i * norm_j + 1e-8)
+        if cos_sim < 0.85:
+            return False
+
+    # Prevent cumulative color drift across chained merges
+    span = np.maximum(cmax_i, cmax_j) - np.minimum(cmin_i, cmin_j)
+    if np.any(span > 1.25 * channel_thresholds):
+        return False
+
+    return True
 
 
 def merge_struct_shapes(
@@ -1219,16 +1259,16 @@ def merge_struct_shapes(
     target_img: np.ndarray,
     layerd_struct_masks: list = None,
     distance_threshold: float = 60.0,
-    max_stack_gap: int = 50,
-    color_range_pct: float = 0.13,
-    sse_threshold: float = 25.0,
+    max_stack_gap: int = 180,
+    color_range_pct: float = 0.085,
+    sse_threshold: float = 8.0,
 ):
     """
-    Merge structural shapes that are spatially close or overlapping, not too far apart in the
-    layer stack, and have similar colors relative to each channel's contrast-aware dynamic range.
-    Merged shapes are bridged via their outer convex-hull common tangents (keeping existing smooth
-    Bezier curves), placed at the lowest stack position min(i, j) with area-weighted color, and
-    reverted if the rendered SSE against target_img increases by more than sse_threshold.
+    Merge structural shapes that are spatially close or overlapping, within max_stack_gap in the
+    layer stack, and have very similar colors (both per-channel and chromatic balance).
+    Merged shapes are bridged via their outer convex-hull common tangents, placed low enough in
+    the layer stack so all foreground objects in the bridged gap remain on top of the merged shape,
+    and reverted if the rendered SSE against target_img increases by more than sse_threshold.
     """
     flat_masks = []
     flat_layer_ids = []
@@ -1258,15 +1298,22 @@ def merge_struct_shapes(
         curr_img = rgba_to_rgb(svg_to_img(img_width, img_height, shapes, shape_groups, device), device)
         curr_sse = torch.nn.functional.mse_loss(curr_img, target_tensor, reduction="sum").item()
 
+        alphas = []
         areas = []
         sampled_curves = []
+        color_mins = []
+        color_maxs = []
         for i, shape in enumerate(shapes):
             alpha = _render_alpha_mask(img_width, img_height, [shape], device)
             area = max(int(torch.sum(alpha).item()), 1)
+            alphas.append(alpha)
             areas.append(area)
             sampled_curves.append(_sample_bezier_points(shape.points))
+            c_init = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
+            color_mins.append(c_init.copy())
+            color_maxs.append(c_init.copy())
 
-        # Keep index 0 (full-canvas background) intact; greedily merge shapes 1..N-1 into lowest index i
+        # Keep index 0 (full-canvas background) intact; iteratively merge shapes 1..N-1
         changed = True
         while changed:
             changed = False
@@ -1275,11 +1322,13 @@ def merge_struct_shapes(
                 j = i + 1
                 merged_any = False
                 while j < len(shapes) and (j - i) <= max_stack_gap:
-                    c_i = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0)
-                    c_j = np.clip(shape_groups[j].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0)
+                    c_i = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
+                    c_j = np.clip(shape_groups[j].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
 
-                    # 1. Contrast-aware per-channel color similarity
-                    if np.any(np.abs(c_i - c_j) > channel_thresholds):
+                    # 1. Contrast-aware per-channel & chromatic color similarity
+                    if not _are_colors_similar(
+                        c_i, c_j, color_mins[i], color_maxs[i], color_mins[j], color_maxs[j], channel_thresholds
+                    ):
                         j += 1
                         continue
 
@@ -1307,63 +1356,118 @@ def merge_struct_shapes(
                         [float(merged_rgb[0]), float(merged_rgb[1]), float(merged_rgb[2]), 1.0]
                     )
 
-                    # 4. Evaluate candidates at lowest stack position i (removing j); revert if SSE degrades too much
+                    # Find common parent background layers k < i that enclose both shapes i and j
+                    min_valid_pos = 1
+                    for k in range(1, i):
+                        if areas[k] > (w_i + w_j):
+                            ov_i = int(torch.sum(alphas[i] & alphas[k]).item())
+                            ov_j = int(torch.sum(alphas[j] & alphas[k]).item())
+                            if ov_i > 0.6 * w_i and ov_j > 0.6 * w_j:
+                                min_valid_pos = k + 1
+
+                    # 4. Evaluate each candidate placed below all gap/sibling shapes k in [min_valid_pos .. i-1]
                     best_cand = None
                     for cand_path in candidates:
-                        shapes_cand = shapes[:i] + [cand_path] + shapes[i + 1 : j] + shapes[j + 1 :]
-                        groups_cand = []
-                        for k_idx in range(len(shapes_cand)):
-                            if k_idx < i:
-                                src_g = shape_groups[k_idx]
-                                fill_c = src_g.fill_color
-                                stroke_c = src_g.stroke_color
-                            elif k_idx == i:
-                                fill_c = merged_fill
-                                stroke_c = shape_groups[i].stroke_color
-                            elif k_idx < j:
-                                src_g = shape_groups[k_idx]
-                                fill_c = src_g.fill_color
-                                stroke_c = src_g.stroke_color
-                            else:
-                                src_g = shape_groups[k_idx + 1]
-                                fill_c = src_g.fill_color
-                                stroke_c = src_g.stroke_color
-                            groups_cand.append(
-                                pydiffvg.ShapeGroup(
-                                    shape_ids=torch.LongTensor([k_idx]),
-                                    fill_color=fill_c,
-                                    stroke_color=stroke_c,
-                                )
-                            )
+                        cand_alpha = _render_alpha_mask(img_width, img_height, [cand_path], device)
+                        cand_area = max(int(torch.sum(cand_alpha).item()), 1)
 
-                        cand_img = rgba_to_rgb(
-                            svg_to_img(img_width, img_height, shapes_cand, groups_cand, device), device
-                        )
-                        cand_sse = torch.nn.functional.mse_loss(cand_img, target_tensor, reduction="sum").item()
-                        if (cand_sse - curr_sse) > sse_threshold:
-                            continue
-                        if best_cand is None or cand_sse < best_cand[0]:
-                            best_cand = (cand_sse, cand_path, shapes_cand, groups_cand)
+                        # Place merged shape below any non-parent shape k < i that cand_alpha overlaps
+                        target_pos = i
+                        for k in range(min_valid_pos, i):
+                            if int(torch.sum(cand_alpha & alphas[k]).item()) > 2:
+                                target_pos = k
+                                break
+
+                        # Test placing at target_pos (and also min_valid_pos if different)
+                        candidate_positions = [target_pos]
+                        if min_valid_pos < target_pos:
+                            candidate_positions.append(min_valid_pos)
+
+                        for pos in candidate_positions:
+                            shapes_cand = (
+                                shapes[:pos]
+                                + [cand_path]
+                                + shapes[pos:i]
+                                + shapes[i + 1 : j]
+                                + shapes[j + 1 :]
+                            )
+                            groups_prev = (
+                                shape_groups[:pos]
+                                + [None]
+                                + shape_groups[pos:i]
+                                + shape_groups[i + 1 : j]
+                                + shape_groups[j + 1 :]
+                            )
+                            groups_cand = []
+                            for k_idx, src_g in enumerate(groups_prev):
+                                if k_idx == pos:
+                                    fill_c = merged_fill
+                                    stroke_c = shape_groups[i].stroke_color
+                                else:
+                                    fill_c = src_g.fill_color
+                                    stroke_c = src_g.stroke_color
+                                groups_cand.append(
+                                    pydiffvg.ShapeGroup(
+                                        shape_ids=torch.LongTensor([k_idx]),
+                                        fill_color=fill_c,
+                                        stroke_color=stroke_c,
+                                    )
+                                )
+
+                            cand_img = rgba_to_rgb(
+                                svg_to_img(img_width, img_height, shapes_cand, groups_cand, device), device
+                            )
+                            cand_sse = torch.nn.functional.mse_loss(cand_img, target_tensor, reduction="sum").item()
+                            if (cand_sse - curr_sse) > sse_threshold:
+                                continue
+                            if best_cand is None or cand_sse < best_cand[0]:
+                                best_cand = (
+                                    cand_sse,
+                                    cand_path,
+                                    cand_alpha,
+                                    cand_area,
+                                    pos,
+                                    shapes_cand,
+                                    groups_cand,
+                                )
 
                     if best_cand is None:
                         j += 1
                         continue
 
-                    # Accept merge into lowest position i and remove j
-                    curr_sse, accepted_path, shapes, shape_groups = best_cand
-                    new_alpha = _render_alpha_mask(img_width, img_height, [accepted_path], device)
-                    areas[i] = max(int(torch.sum(new_alpha).item()), 1)
-                    areas.pop(j)
-                    sampled_curves[i] = _sample_bezier_points(accepted_path.points)
-                    sampled_curves.pop(j)
+                    # Accept merge at pos <= i and remove original i and j
+                    curr_sse, accepted_path, acc_alpha, acc_area, pos, shapes, shape_groups = best_cand
+                    new_cmin = np.minimum(color_mins[i], color_mins[j])
+                    new_cmax = np.maximum(color_maxs[i], color_maxs[j])
+                    new_sampled = _sample_bezier_points(accepted_path.points)
+
+                    # Remove j then i, and insert at pos
+                    for lst, new_val in (
+                        (alphas, acc_alpha),
+                        (areas, acc_area),
+                        (sampled_curves, new_sampled),
+                        (color_mins, new_cmin),
+                        (color_maxs, new_cmax),
+                    ):
+                        lst.pop(j)
+                        lst.pop(i)
+                        lst.insert(pos, new_val)
 
                     if has_valid_masks:
-                        flat_masks[i] = np.maximum(flat_masks[i], flat_masks[j])
+                        merged_mask_u8 = np.maximum(flat_masks[i], flat_masks[j])
                         flat_masks.pop(j)
+                        flat_masks.pop(i)
+                        flat_masks.insert(pos, merged_mask_u8)
+                        target_lid = flat_layer_ids[pos] if pos < len(flat_layer_ids) else flat_layer_ids[i]
                         flat_layer_ids.pop(j)
+                        flat_layer_ids.pop(i)
+                        flat_layer_ids.insert(pos, target_lid)
 
                     merged_any = True
                     changed = True
+                    # If pos < i, restart scan from pos so the newly lowered shape can merge with further shapes
+                    i = pos
+                    break
 
                 if not merged_any:
                     i += 1
@@ -1386,7 +1490,8 @@ def simplify_concave_shapes(
     shapes: list,
     shape_groups: list,
     target_img: np.ndarray,
-    sse_threshold: float = 3.0,
+    sse_threshold: float = 1.0,
+    straighten_segments: bool = False,
 ):
     """Bottom-to-top pass removing concave angles/curves that do not degrade summed squared error against target_img."""
     img_height, img_width = target_img.shape[:2]
@@ -1440,9 +1545,10 @@ def simplify_concave_shapes(
                     if changed:
                         continue
 
-                for k in _find_concave_segments(pts, orient):
-                    if _accept_best([_straighten_segment(shapes[i], k)]):
-                        changed = True
-                        break
+                if straighten_segments:
+                    for k in _find_concave_segments(pts, orient):
+                        if _accept_best([_straighten_segment(shapes[i], k)]):
+                            changed = True
+                            break
 
     return shapes, shape_groups

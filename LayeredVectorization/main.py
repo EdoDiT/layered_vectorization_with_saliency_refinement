@@ -264,7 +264,8 @@ def layered_vectorization(args,device=None):
             shapes,
             shape_groups,
             target_img,
-            sse_threshold=getattr(args, "concave_sse_threshold", 3.0),
+            sse_threshold=getattr(args, "concave_sse_threshold", 1.0),
+            straighten_segments=getattr(args, "is_straighten_concave_segments", False),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/concave_simplified.svg",img_height,img_width,shapes,shape_groups)
     if getattr(args, "is_merge_struct", True):
@@ -276,9 +277,9 @@ def layered_vectorization(args,device=None):
             target_img,
             layerd_struct_masks,
             distance_threshold=getattr(args, "struct_merge_distance_threshold", 60.0),
-            max_stack_gap=getattr(args, "struct_merge_max_stack_gap", 50),
-            color_range_pct=getattr(args, "struct_merge_color_range_pct", 0.13),
-            sse_threshold=getattr(args, "struct_merge_sse_threshold", 25.0),
+            max_stack_gap=getattr(args, "struct_merge_max_stack_gap", 180),
+            color_range_pct=getattr(args, "struct_merge_color_range_pct", 0.085),
+            sse_threshold=getattr(args, "struct_merge_sse_threshold", 8.0),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/struct_merged.svg",img_height,img_width,shapes,shape_groups)
     if args.color_fitting_type not in ["dominan","mse"]:
