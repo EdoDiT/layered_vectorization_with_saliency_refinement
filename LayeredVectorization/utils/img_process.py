@@ -1415,10 +1415,12 @@ def simplify_concave_shapes(
     shape_groups: list,
     target_img: np.ndarray,
     sse_threshold: float = 1.0,
+    max_changed_pct: float = 0.0015,
     straighten_segments: bool = False,
 ):
-    """Bottom-to-top pass removing concave angles/curves that do not degrade summed squared error against target_img."""
+    """Bottom-to-top pass removing concave angles/curves that do not visibly alter too much of the image or degrade SSE against target_img."""
     img_height, img_width = target_img.shape[:2]
+    total_pixels = float(img_height * img_width)
     target_tensor = (torch.tensor(target_img, device=device, dtype=torch.float32) / 255.0).permute(2, 0, 1)
 
     with torch.no_grad():
@@ -1427,22 +1429,25 @@ def simplify_concave_shapes(
 
         for i in tqdm(range(len(shapes)), desc="Concave simplification", unit="shape"):
             def _accept_best(candidates: List[pydiffvg.Path]) -> bool:
-                nonlocal curr_sse
+                nonlocal curr_sse, curr_img
                 best = None
                 for cand_path in candidates:
                     shapes_cand = shapes[:i] + [cand_path] + shapes[i + 1 :]
                     cand_img = rgba_to_rgb(svg_to_img(img_width, img_height, shapes_cand, shape_groups, device), device)
+                    changed_pct = torch.sum(torch.max(torch.abs(cand_img - curr_img), dim=0)[0] > 0.05).item() / total_pixels
+                    if changed_pct > max_changed_pct:
+                        continue
                     cand_sse = torch.nn.functional.mse_loss(cand_img, target_tensor, reduction="sum").item()
                     if (cand_sse - curr_sse) > sse_threshold:
                         continue
 
                     if best is None or cand_sse < best[0]:
-                        best = (cand_sse, cand_path)
+                        best = (cand_sse, cand_path, cand_img)
 
                 if best is None:
                     return False
 
-                curr_sse, shapes[i] = best
+                curr_sse, shapes[i], curr_img = best
                 return True
 
             changed = True

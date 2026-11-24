@@ -265,6 +265,7 @@ def layered_vectorization(args,device=None):
             shape_groups,
             target_img,
             sse_threshold=getattr(args, "concave_sse_threshold", 1.0),
+            max_changed_pct=getattr(args, "concave_max_changed_pct", 0.0015),
             straighten_segments=getattr(args, "is_straighten_concave_segments", False),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/concave_simplified.svg",img_height,img_width,shapes,shape_groups)

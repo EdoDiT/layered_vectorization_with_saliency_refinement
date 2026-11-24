@@ -15,6 +15,7 @@ paths_remove_visual_threshold: 7.0
 # Concave simplification phase (after structural optimization)
 is_simplify_concave: True
 concave_sse_threshold: 1.0
+concave_max_changed_pct: 0.0015
 is_straighten_concave_segments: False
 
 # Structural shape merging phase (after concave simplification, before color fitting)
