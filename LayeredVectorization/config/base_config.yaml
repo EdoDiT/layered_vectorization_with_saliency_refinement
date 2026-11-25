@@ -12,26 +12,26 @@ paths_merge_color_threshold: 0.1
 paths_merge_distance_threshold: 3
 paths_remove_visual_threshold: 7.0
 
-# Depth-ordered overlapping structural phase (unified masks + convex hull + composite render)
-is_depth_ordered_struct: True
-is_split_connected_components: False
-is_use_convex_hull_init: True
+# Depth-ordered overlapping structural phase (disabled by default; use original per-layer optimization)
+is_depth_ordered_struct: False
+is_split_connected_components: True
+is_use_convex_hull_init: False
 depth_model_id: "depth-anything/Depth-Anything-V2-Small-hf"
 
 # Coarse-to-fine structural control point scheduling ("squinting")
 is_coarse_to_fine: True
 coarse_init_max_segments: 4
-coarse_max_split_rounds: 5
-coarse_initial_iters: 30
-coarse_refine_iters: 15
-coarse_split_error_threshold: 0.005
+coarse_max_split_rounds: 12
+coarse_initial_iters: 25
+coarse_refine_iters: 10
+coarse_split_error_threshold: 0.003
 
 # Scale-proportional geometric regularization (short segments, asymmetric handles, elastica)
 is_geom_loss: True
 geom_min_seg_ratio: 0.25
-geom_short_seg_weight: 0.01
-geom_handle_asym_weight: 0.005
-geom_elastica_weight: 0.002
+geom_short_seg_weight: 0.005
+geom_handle_asym_weight: 0.002
+geom_elastica_weight: 0.0005
 geom_elastica_length_weight: 0.2
 geom_elastica_curv_weight: 1.0
 

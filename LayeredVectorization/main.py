@@ -351,8 +351,8 @@ def layered_vectorization(args,device=None):
     img_height, img_width = target_img.shape[:2]
 
     print("SAM...")
-    is_depth_ordered_struct = getattr(args, "is_depth_ordered_struct", True)
-    is_split_cc = getattr(args, "is_split_connected_components", not is_depth_ordered_struct)
+    is_depth_ordered_struct = getattr(args, "is_depth_ordered_struct", False)
+    is_split_cc = getattr(args, "is_split_connected_components", True)
     masks = sam_img_seq(device, simp_img_seq, masks_save_path, args.sam, split_connected_components=is_split_cc)
 
     print("Layered Structure Reconstruction...")
@@ -360,22 +360,22 @@ def layered_vectorization(args,device=None):
     coarse_conf = {
         "is_coarse_to_fine": getattr(args, "is_coarse_to_fine", True),
         "coarse_init_max_segments": getattr(args, "coarse_init_max_segments", 4),
-        "coarse_max_split_rounds": getattr(args, "coarse_max_split_rounds", 5),
-        "coarse_initial_iters": getattr(args, "coarse_initial_iters", 30),
-        "coarse_refine_iters": getattr(args, "coarse_refine_iters", 15),
-        "coarse_split_error_threshold": getattr(args, "coarse_split_error_threshold", 0.005),
+        "coarse_max_split_rounds": getattr(args, "coarse_max_split_rounds", 12),
+        "coarse_initial_iters": getattr(args, "coarse_initial_iters", 25),
+        "coarse_refine_iters": getattr(args, "coarse_refine_iters", 10),
+        "coarse_split_error_threshold": getattr(args, "coarse_split_error_threshold", 0.003),
     }
     geom_conf = {
         "is_geom_loss": getattr(args, "is_geom_loss", True),
         "geom_min_seg_ratio": getattr(args, "geom_min_seg_ratio", 0.25),
-        "geom_short_seg_weight": getattr(args, "geom_short_seg_weight", 0.01),
-        "geom_handle_asym_weight": getattr(args, "geom_handle_asym_weight", 0.005),
-        "geom_elastica_weight": getattr(args, "geom_elastica_weight", 0.002),
+        "geom_short_seg_weight": getattr(args, "geom_short_seg_weight", 0.005),
+        "geom_handle_asym_weight": getattr(args, "geom_handle_asym_weight", 0.002),
+        "geom_elastica_weight": getattr(args, "geom_elastica_weight", 0.0005),
         "geom_elastica_length_weight": getattr(args, "geom_elastica_length_weight", 0.2),
         "geom_elastica_curv_weight": getattr(args, "geom_elastica_curv_weight", 1.0),
     }
     max_init_segments = coarse_conf["coarse_init_max_segments"] if coarse_conf["is_coarse_to_fine"] else None
-    use_convex_hull = getattr(args, "is_use_convex_hull_init", is_depth_ordered_struct)
+    use_convex_hull = getattr(args, "is_use_convex_hull_init", False)
 
     layerd_struct_masks = layer_segmented_masks([[masks[0]]], masks[1:])
     layerd_struct_masks = get_struct_masks_by_area(layerd_struct_masks, int(args.max_path_num_limit * 0.7))
