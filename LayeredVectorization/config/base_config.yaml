@@ -12,14 +12,23 @@ paths_merge_color_threshold: 0.1
 paths_merge_distance_threshold: 3
 paths_remove_visual_threshold: 7.0
 
-# Depth-ordered overlapping structural phase (disabled by default; use original per-layer optimization)
+# Pairwise depth-occlusion layering + convex-hull notch filling (keeps multi-shape per-layer loss)
+is_depth_occlusion_layering: True
+depth_far_k_px: 64
+depth_erode_px: 4
+depth_margin: 0.08
+depth_touch_px: 5
+is_fill_occluded_concavities: True
+fill_safety_erode_px: 3
+
+# Legacy global 1-shape-per-layer depth mode (keep False)
 is_depth_ordered_struct: False
 is_split_connected_components: True
 is_use_convex_hull_init: False
 depth_model_id: "depth-anything/Depth-Anything-V2-Small-hf"
 
 # Coarse-to-fine structural control point scheduling ("squinting")
-is_coarse_to_fine: True
+is_coarse_to_fine: False
 coarse_init_max_segments: 4
 coarse_max_split_rounds: 8
 coarse_initial_iters: 25
@@ -35,9 +44,9 @@ coarse_snap_radius: 30
 # Scale-proportional geometric regularization (short segments, asymmetric handles, elastica)
 is_geom_loss: True
 geom_min_seg_ratio: 0.25
-geom_short_seg_weight: 0.005
-geom_handle_asym_weight: 0.002
-geom_elastica_weight: 0.0005
+geom_short_seg_weight: 0.05
+geom_handle_asym_weight: 0.02
+geom_elastica_weight: 0.0
 geom_elastica_length_weight: 0.2
 geom_elastica_curv_weight: 1.0
 

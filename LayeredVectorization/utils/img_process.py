@@ -366,18 +366,20 @@ def init_svg_by_mask(
     epsilon: int = 5,
     max_init_segments: Optional[int] = None,
     use_convex_hull: bool = False,
+    color_masks: Optional[list] = None,
 ):
-    shapes =[]
-    shape_groups=[]
-    for masks in layerd_masks:
-        for mask in masks:
+    shapes = []
+    shape_groups = []
+    for layer_i, masks in enumerate(layerd_masks):
+        for mask_j, mask in enumerate(masks):
             path = init_path_by_mask(
                 mask,
                 epsilon=epsilon,
                 max_init_segments=max_init_segments,
                 use_convex_hull=use_convex_hull,
             )
-            mean_color = get_mean_color(target_img,mask)
+            cmask = color_masks[layer_i][mask_j] if color_masks is not None else mask
+            mean_color = get_mean_color(target_img, cmask)
             path_group = pydiffvg.ShapeGroup(
                                     shape_ids=torch.LongTensor([len(shapes)]),
                                     fill_color=torch.tensor(list(mean_color)+[255])/255,
@@ -963,6 +965,250 @@ def order_masks_by_depth(layerd_struct_masks: list, depth_map: np.ndarray) -> li
 
     ordered = [base_mask] + [it["mask"] for it in items]
     return [[m] for m in ordered]
+
+
+def refine_layers_with_depth_and_fill(
+    layerd_struct_masks: list,
+    depth_map: np.ndarray,
+    target_img: np.ndarray,
+    depth_far_k_px: int = 64,
+    depth_erode_px: int = 4,
+    depth_margin: float = 0.08,
+    depth_touch_px: int = 5,
+    fill_concavities: bool = True,
+    fill_safety_erode_px: int = 3,
+):
+    """Build multi-shape layers using pairwise depth occlusion between touching masks,
+    and fill higher-layer occluder notches inside each lower mask's convex hull.
+
+    Returns `(raw_layered, filled_layered, debug_bgr)`:
+    - `raw_layered`: masks grouped into multi-shape layers (for color fitting).
+    - `filled_layered`: same structure with occluded notches filled (for path init & struct loss).
+    - `debug_bgr`: side-by-side visualization of layer indices (left) and filled notches (right).
+    """
+    base_mask = layerd_struct_masks[0][0]
+    masks_list = [m for layer in layerd_struct_masks[1:] for m in layer]
+    m_count = len(masks_list)
+    h, w = base_mask.shape[:2]
+
+    if m_count == 0:
+        raw_layered = [[base_mask]]
+        filled_layered = [[base_mask.copy()]]
+        debug_bgr = np.zeros((h, w * 2, 3), dtype=np.uint8)
+        return raw_layered, filled_layered, debug_bgr
+
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * depth_erode_px + 1, 2 * depth_erode_px + 1))
+    small_erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    touch_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * depth_touch_px + 1, 2 * depth_touch_px + 1))
+
+    fgs = []
+    areas = []
+    d_fars = []
+    dils = []
+
+    for m in masks_list:
+        m_u8 = (m > 0).astype(np.uint8) * 255
+        fg = m_u8 > 0
+        area = int(fg.sum())
+        core = cv2.erode(m_u8, erode_k) > 0 if depth_erode_px > 0 else fg
+        if int(core.sum()) < depth_far_k_px:
+            core = cv2.erode(m_u8, small_erode_k) > 0
+        if int(core.sum()) < 8:
+            core = fg
+        if area > 0:
+            sorted_d = np.sort(depth_map[core])
+            k_take = min(max(1, depth_far_k_px), len(sorted_d))
+            d_val = float(sorted_d[:k_take].mean())
+        else:
+            d_val = 0.0
+        dil = cv2.dilate(m_u8, touch_k) > 0 if depth_touch_px > 0 else fg
+
+        fgs.append(fg)
+        areas.append(area)
+        d_fars.append(d_val)
+        dils.append(dil)
+
+    # Directed graph: edge u -> v means u must sit in a strictly lower layer than v
+    adj = [set() for _ in range(m_count)]
+
+    def _can_reach(src: int, dst: int) -> bool:
+        stack = [src]
+        seen = {src}
+        while stack:
+            cur = stack.pop()
+            if cur == dst:
+                return True
+            for nxt in adj[cur]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return False
+
+    # 1. Hard containment edges (smaller mask >=50% inside larger mask goes above it)
+    for i in range(m_count):
+        for j in range(i + 1, m_count):
+            if areas[i] == 0 or areas[j] == 0:
+                continue
+            inter = int(np.sum(fgs[i] & fgs[j]))
+            if inter == 0:
+                continue
+            if areas[j] < areas[i] and (inter / areas[j]) >= 0.50:
+                if not _can_reach(j, i):
+                    adj[i].add(j)
+            elif areas[i] < areas[j] and (inter / areas[i]) >= 0.50:
+                if not _can_reach(i, j):
+                    adj[j].add(i)
+
+    # 2. Pairwise depth occlusion edges between touching/overlapping masks (strongest |delta_d| first)
+    depth_candidates = []
+    for i in range(m_count):
+        for j in range(i + 1, m_count):
+            if (j in adj[i]) or (i in adj[j]):
+                continue
+            if not (np.any(dils[i] & fgs[j]) or np.any(dils[j] & fgs[i])):
+                continue
+            diff = d_fars[j] - d_fars[i]
+            if abs(diff) >= depth_margin:
+                if diff > 0:
+                    depth_candidates.append((diff, i, j))
+                else:
+                    depth_candidates.append((-diff, j, i))
+
+    depth_candidates.sort(key=lambda x: -x[0])
+    added_depth_edges = 0
+    for _, u, v in depth_candidates:
+        if not _can_reach(v, u):
+            adj[u].add(v)
+            added_depth_edges += 1
+
+    # 3. Minimum-layer assignment on DAG (disjoint / uncomparable masks share the same layer)
+    indeg = [0] * m_count
+    preds = [[] for _ in range(m_count)]
+    for u in range(m_count):
+        for v in adj[u]:
+            indeg[v] += 1
+            preds[v].append(u)
+
+    queue = [i for i in range(m_count) if indeg[i] == 0]
+    layer_id = [1] * m_count
+    topo = []
+    while queue:
+        u = queue.pop(0)
+        topo.append(u)
+        if preds[u]:
+            layer_id[u] = max(layer_id[p] + 1 for p in preds[u])
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                queue.append(v)
+
+    max_layer = max(layer_id)
+    raw_layered = [[base_mask]]
+    for lid in range(1, max_layer + 1):
+        members = [i for i in range(m_count) if layer_id[i] == lid]
+        members.sort(key=lambda idx: -areas[idx])
+        if members:
+            raw_layered.append([masks_list[i] for i in members])
+
+    # 4. Fill higher-layer occluder notches inside each lower mask's convex hull
+    num_layers = len(raw_layered)
+    filled_layered = [[m.copy() for m in layer] for layer in raw_layered]
+    total_filled_masks = 0
+    total_filled_px = 0
+
+    if fill_concavities and num_layers > 2:
+        higher_unions = [np.zeros((h, w), dtype=bool) for _ in range(num_layers)]
+        running_union = np.zeros((h, w), dtype=bool)
+        for lid in range(num_layers - 1, 0, -1):
+            higher_unions[lid] = running_union.copy()
+            for m in raw_layered[lid]:
+                running_union |= m > 0
+
+        safe_k = (
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * fill_safety_erode_px + 1, 2 * fill_safety_erode_px + 1))
+            if fill_safety_erode_px > 0
+            else None
+        )
+        sep_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+        for lid in range(1, num_layers - 1):
+            h_union = higher_unions[lid]
+            if not np.any(h_union):
+                continue
+            layer_masks = raw_layered[lid]
+            layer_fgs = [m > 0 for m in layer_masks]
+
+            for idx, m in enumerate(layer_masks):
+                m_fg = layer_fgs[idx]
+                m_u8 = m_fg.astype(np.uint8) * 255
+                cnts, _ = cv2.findContours(m_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                if len(cnts) == 0:
+                    continue
+                hull = cv2.convexHull(np.vstack(cnts))
+                hull_u8 = np.zeros((h, w), dtype=np.uint8)
+                cv2.drawContours(hull_u8, [hull], -1, 255, thickness=cv2.FILLED)
+                hull_fg = hull_u8 > 0
+
+                allowed_u8 = (m_fg | h_union).astype(np.uint8) * 255
+                safe_fg = (cv2.erode(allowed_u8, safe_k) > 0) if safe_k is not None else (m_fg | h_union)
+
+                if len(layer_fgs) > 1:
+                    other_fg = np.zeros((h, w), dtype=bool)
+                    for k_idx, k_fg in enumerate(layer_fgs):
+                        if k_idx != idx:
+                            other_fg |= k_fg
+                    other_dil = cv2.dilate(other_fg.astype(np.uint8) * 255, sep_k) > 0
+                else:
+                    other_dil = np.zeros((h, w), dtype=bool)
+
+                cand_fg = m_fg | (hull_fg & safe_fg & (~other_dil))
+                added_px = int(np.sum(cand_fg & (~m_fg)))
+                if added_px <= 0:
+                    continue
+
+                # Keep only connected components touching the original mask
+                num_cc, cc_labels = cv2.connectedComponents(cand_fg.astype(np.uint8) * 255)
+                touching_labels = set(np.unique(cc_labels[m_fg])) - {0}
+                clean_fg = np.isin(cc_labels, list(touching_labels))
+                clean_u8 = filling_mask_holes(clean_fg.astype(np.uint8) * 255)
+
+                real_added = int(np.sum((clean_u8 > 0) & (~m_fg)))
+                if real_added > 0:
+                    filled_layered[lid][idx] = clean_u8
+                    total_filled_masks += 1
+                    total_filled_px += real_added
+
+    print(
+        f"[depth-occlusion] {num_layers} layers (sizes {[len(l) for l in raw_layered]}), "
+        f"{added_depth_edges} depth edges, filled {total_filled_masks} masks (+{total_filled_px} px)"
+    )
+
+    # 5. Build debug image (BGR for cv2.imwrite): left = layer map, right = notch fills in magenta
+    gray = cv2.cvtColor(target_img.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    gray_rgb = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
+
+    layer_idx_map = np.zeros((h, w), dtype=np.float32)
+    for lid, layer in enumerate(raw_layered):
+        for m in layer:
+            layer_idx_map[m > 0] = float(lid) / max(num_layers - 1, 1)
+    cmap_bgr = cv2.applyColorMap((layer_idx_map * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    cmap_rgb = cv2.cvtColor(cmap_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    left_rgb = np.clip(0.30 * gray_rgb + 0.70 * cmap_rgb, 0, 255).astype(np.uint8)
+
+    right_rgb = np.clip(target_img.astype(np.float32) * 0.75, 0, 255).astype(np.uint8)
+    added_any = np.zeros((h, w), dtype=bool)
+    for lid in range(1, num_layers):
+        for r_m, f_m in zip(raw_layered[lid], filled_layered[lid]):
+            diff_fg = (f_m > 0) & (~(r_m > 0))
+            if np.any(diff_fg):
+                added_any |= diff_fg
+                cnts, _ = cv2.findContours((f_m > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(right_rgb, cnts, -1, (0, 255, 255), 1)
+    right_rgb[added_any] = np.array([255, 0, 200], dtype=np.uint8)
+
+    debug_rgb = np.concatenate([left_rgb, right_rgb], axis=1)
+    debug_bgr = cv2.cvtColor(debug_rgb, cv2.COLOR_RGB2BGR)
+    return raw_layered, filled_layered, debug_bgr
 
 
 def init_composite_struct_target(ordered_masks: list, device: torch.device):

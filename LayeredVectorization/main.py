@@ -368,6 +368,10 @@ def layered_vectorization(args,device=None):
         os.makedirs(masks_save_path,exist_ok=True)
     struct_svgs_save_path = f"./workdir/{args.file_save_name}/struct_svgs"
     os.makedirs(struct_svgs_save_path,exist_ok=True)
+    # Remove leftovers from previous runs so the highest-numbered file is always from this run
+    for stale_svg in os.listdir(struct_svgs_save_path):
+        if stale_svg.endswith(".svg"):
+            os.remove(os.path.join(struct_svgs_save_path, stale_svg))
     visual_svgs_save_path = f"./workdir/{args.file_save_name}/struct&visual_svgs"
     os.makedirs(visual_svgs_save_path,exist_ok=True)
     layerd_struct_save_path = f"./workdir/{args.file_save_name}/layerd_struct"
@@ -390,7 +394,7 @@ def layered_vectorization(args,device=None):
     print("Layered Structure Reconstruction...")
     # Structural layer optimization.
     coarse_conf = {
-        "is_coarse_to_fine": getattr(args, "is_coarse_to_fine", True),
+        "is_coarse_to_fine": getattr(args, "is_coarse_to_fine", False),
         "coarse_init_max_segments": getattr(args, "coarse_init_max_segments", 4),
         "coarse_max_split_rounds": getattr(args, "coarse_max_split_rounds", 8),
         "coarse_initial_iters": getattr(args, "coarse_initial_iters", 25),
@@ -403,9 +407,9 @@ def layered_vectorization(args,device=None):
     geom_conf = {
         "is_geom_loss": getattr(args, "is_geom_loss", True),
         "geom_min_seg_ratio": getattr(args, "geom_min_seg_ratio", 0.25),
-        "geom_short_seg_weight": getattr(args, "geom_short_seg_weight", 0.005),
-        "geom_handle_asym_weight": getattr(args, "geom_handle_asym_weight", 0.002),
-        "geom_elastica_weight": getattr(args, "geom_elastica_weight", 0.0005),
+        "geom_short_seg_weight": getattr(args, "geom_short_seg_weight", 0.05),
+        "geom_handle_asym_weight": getattr(args, "geom_handle_asym_weight", 0.02),
+        "geom_elastica_weight": getattr(args, "geom_elastica_weight", 0.0),
         "geom_elastica_length_weight": getattr(args, "geom_elastica_length_weight", 0.2),
         "geom_elastica_curv_weight": getattr(args, "geom_elastica_curv_weight", 1.0),
     }
@@ -414,12 +418,33 @@ def layered_vectorization(args,device=None):
 
     layerd_struct_masks = layer_segmented_masks([[masks[0]]], masks[1:])
     layerd_struct_masks = get_struct_masks_by_area(layerd_struct_masks, int(args.max_path_num_limit * 0.7))
-    if is_depth_ordered_struct:
+
+    is_depth_occlusion = getattr(args, "is_depth_occlusion_layering", True)
+    raw_layerd_struct_masks = layerd_struct_masks
+    if is_depth_occlusion and not is_depth_ordered_struct:
+        print("Depth-Occlusion Layering & Notch Filling...")
+        depth_model_id = getattr(args, "depth_model_id", "depth-anything/Depth-Anything-V2-Small-hf")
+        depth_map = compute_depth_map(device, target_img, model_id=depth_model_id)
+        cv2.imwrite(f"./workdir/{args.file_save_name}/depth_map.png", (depth_map * 255).astype(np.uint8))
+        raw_layerd_struct_masks, layerd_struct_masks, debug_bgr = refine_layers_with_depth_and_fill(
+            layerd_struct_masks,
+            depth_map,
+            target_img,
+            depth_far_k_px=getattr(args, "depth_far_k_px", 64),
+            depth_erode_px=getattr(args, "depth_erode_px", 4),
+            depth_margin=getattr(args, "depth_margin", 0.08),
+            depth_touch_px=getattr(args, "depth_touch_px", 5),
+            fill_concavities=getattr(args, "is_fill_occluded_concavities", True),
+            fill_safety_erode_px=getattr(args, "fill_safety_erode_px", 3),
+        )
+        cv2.imwrite(f"./workdir/{args.file_save_name}/layer_targets_debug.png", debug_bgr)
+    elif is_depth_ordered_struct:
         print("Depth Ordering...")
         depth_model_id = getattr(args, "depth_model_id", "depth-anything/Depth-Anything-V2-Small-hf")
         depth_map = compute_depth_map(device, target_img, model_id=depth_model_id)
         cv2.imwrite(f"./workdir/{args.file_save_name}/depth_map.png", (depth_map * 255).astype(np.uint8))
         layerd_struct_masks = order_masks_by_depth(layerd_struct_masks, depth_map)
+        raw_layerd_struct_masks = layerd_struct_masks
 
     shapes, shape_groups = init_svg_by_mask(
         layerd_struct_masks,
@@ -427,6 +452,7 @@ def layered_vectorization(args,device=None):
         args.approxpolydp_epsilon,
         max_init_segments=max_init_segments,
         use_convex_hull=use_convex_hull,
+        color_masks=raw_layerd_struct_masks,
     )
     shapes, shape_groups = svg_optimize_img_struct(device, shapes, shape_groups,
                                                    target_img,
@@ -440,7 +466,7 @@ def layered_vectorization(args,device=None):
     if args.color_fitting_type not in ["dominan","mse"]:
         raise ValueError(f"args.color_fitting_type can only be 'dominan' or 'mse', but the values passed in are {args.color_fitting_type}")
     if args.color_fitting_type == "dominan":
-        shape_groups,target_img_cluster = color_fitting(shape_groups, target_img, layerd_struct_masks, args.is_cluster_target_img, args.kmeas_k)
+        shape_groups,target_img_cluster = color_fitting(shape_groups, target_img, raw_layerd_struct_masks, args.is_cluster_target_img, args.kmeas_k)
         target_img_cluster_ = Image.fromarray(target_img_cluster)
         target_img_cluster_.save(f"./workdir/{args.file_save_name}/cluster_img.png")
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/color-adjusted.svg",img_height,img_width,shapes,shape_groups)
