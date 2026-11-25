@@ -6,10 +6,11 @@ import os
 import glob
 from torchvision import transforms
 import torch
+import torch.nn.functional as F
 import pydiffvg
 from collections import Counter
 from scipy.spatial.distance import cdist
-from typing import Union,List
+from typing import Union, List, Optional
 from tqdm import tqdm
 import time
 import random
@@ -37,16 +38,20 @@ def rgba_to_rgb(img: torch.Tensor, device, para_bg=None):
     img = img.permute(2, 0, 1)
     return img
 
-def sam_img_seq(device, simp_img_seq: list, masks_save_path: str = "-1", sam_conf: dict = None) -> list:
+def sam_img_seq(device, simp_img_seq: list, masks_save_path: str = "-1", sam_conf: dict = None, split_connected_components: bool = True) -> list:
     def mask_preprocessing(masks):
         prepro_masks = []
         for mask in masks:
             filled_mask = filling_mask_holes(mask)
-            num_labels, labels = cv2.connectedComponents(filled_mask)
-            for i in range(1, num_labels):
-                single_region = np.zeros_like(mask)
-                single_region[labels == i] = 255
-                prepro_masks.append(single_region)
+            if split_connected_components:
+                num_labels, labels = cv2.connectedComponents(filled_mask)
+                for i in range(1, num_labels):
+                    single_region = np.zeros_like(mask)
+                    single_region[labels == i] = 255
+                    prepro_masks.append(single_region)
+            else:
+                if cv2.countNonZero(filled_mask) > 0:
+                    prepro_masks.append(filled_mask)
         return prepro_masks
     
     def sorted_masks(masks):
@@ -250,7 +255,44 @@ def save_contours_as_single_png(contour1, contour2, filename):
     cv2.imwrite(filename, image)
 
 
-def init_path_by_mask(mask: Union[np.ndarray,torch.Tensor], epsilon: int = 5):
+def _simplify_contour_to_max_vertices(contour: np.ndarray, epsilon: float, max_vertices: int) -> np.ndarray:
+    """Adaptively increase approxPolyDP epsilon until contour has at most max_vertices (>= 3)."""
+    simplified = cv2.approxPolyDP(contour, epsilon, closed=True)
+    if len(simplified) <= max_vertices:
+        return simplified
+
+    perimeter = cv2.arcLength(contour, True)
+    lo = float(epsilon)
+    hi = max(perimeter, lo + 1.0)
+    best = None
+
+    for _ in range(20):
+        mid = 0.5 * (lo + hi)
+        cand = cv2.approxPolyDP(contour, mid, closed=True)
+        n = len(cand)
+        if n > max_vertices:
+            lo = mid
+        elif n >= 3:
+            best = cand
+            hi = mid
+        else:
+            hi = mid
+
+    if best is not None:
+        return best
+
+    # Fallback: oriented bounding box (4 clean vertices hugging the silhouette)
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+    return box.reshape(-1, 1, 2).astype(np.float32)
+
+
+def init_path_by_mask(
+    mask: Union[np.ndarray, torch.Tensor],
+    epsilon: int = 5,
+    max_init_segments: Optional[int] = None,
+    use_convex_hull: bool = False,
+):
     def insert_points_in_segments(points, num_interpolations=2):
         def interpolate_points(point1, point2, num_interpolations):
             x_values = np.linspace(point1[0], point2[0], num=num_interpolations + 2)[1:-1]
@@ -274,14 +316,20 @@ def init_path_by_mask(mask: Union[np.ndarray,torch.Tensor], epsilon: int = 5):
     mask = np.where(mask > 1, 255, 0).astype(np.uint8)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
-    while len(contours)>1:
-        point_1, point_2 = find_closest_contours(contours)
-        cv2.line(mask, point_1, point_2, (255), 3)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if use_convex_hull:
+        all_pts = np.vstack(contours)
+        contour = cv2.convexHull(all_pts)
+    else:
+        while len(contours)>1:
+            point_1, point_2 = find_closest_contours(contours)
+            cv2.line(mask, point_1, point_2, (255), 3)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        contour = contours[0]
 
-    contour = contours[0]
-
-    simplified_contour = cv2.approxPolyDP(contour, epsilon, closed=True)
+    if max_init_segments is not None and max_init_segments >= 3:
+        simplified_contour = _simplify_contour_to_max_vertices(contour, epsilon, max_init_segments)
+    else:
+        simplified_contour = cv2.approxPolyDP(contour, epsilon, closed=True)
     if len(simplified_contour)==2:
         new_point = np.array([simplified_contour[0,0,0]+random.uniform(2, 5),simplified_contour[0,0,1]+random.uniform(2, 5)])
         simplified_contour = np.insert(simplified_contour, 1, new_point, axis=0)
@@ -312,12 +360,23 @@ def get_mean_color(image: np.ndarray, mask: np.ndarray):
             average_color = (0, 0, 0)
         return average_color
 
-def init_svg_by_mask(layerd_masks: list,target_img: np.ndarray, epsilon:int = 5):
+def init_svg_by_mask(
+    layerd_masks: list,
+    target_img: np.ndarray,
+    epsilon: int = 5,
+    max_init_segments: Optional[int] = None,
+    use_convex_hull: bool = False,
+):
     shapes =[]
     shape_groups=[]
     for masks in layerd_masks:
         for mask in masks:
-            path = init_path_by_mask(mask,epsilon=epsilon)
+            path = init_path_by_mask(
+                mask,
+                epsilon=epsilon,
+                max_init_segments=max_init_segments,
+                use_convex_hull=use_convex_hull,
+            )
             mean_color = get_mean_color(target_img,mask)
             path_group = pydiffvg.ShapeGroup(
                                     shape_ids=torch.LongTensor([len(shapes)]),
@@ -330,12 +389,11 @@ def init_svg_by_mask(layerd_masks: list,target_img: np.ndarray, epsilon:int = 5)
 
 
 def color_fitting(shape_groups, target_img: np.ndarray, layerd_struct_masks: list, is_cluster: bool, k: int = 30):
-    def combine_masks(masks):
-        combine_masks = masks[0].copy()
-        if len(masks)>1:
-            for mask in masks[1:]:
-                combine_masks+=mask
-        return combine_masks
+    def combine_masks(masks_list):
+        combined = np.zeros_like(masks_list[0])
+        for m in masks_list:
+            combined = cv2.bitwise_or(combined, m)
+        return combined
     if is_cluster:
         data = target_img.reshape((-1, 3))
         data = np.float32(data)
@@ -345,26 +403,31 @@ def color_fitting(shape_groups, target_img: np.ndarray, layerd_struct_masks: lis
         segmented_data = centers[labels.flatten()]
         target_img = segmented_data.reshape((target_img.shape))
 
-    most_common_color_list =[]
-    for i,masks in enumerate(layerd_struct_masks):
-        if i<=len(layerd_struct_masks)-2:
-            masks_combine = combine_masks(layerd_struct_masks[i+1])
+    most_common_color_list = []
+    for i, masks in enumerate(layerd_struct_masks):
+        if i <= len(layerd_struct_masks) - 2:
+            above_masks = [m for higher_layer in layerd_struct_masks[i + 1 :] for m in higher_layer]
+            masks_combine = combine_masks(above_masks)
         else:
             masks_combine = np.zeros_like(masks[0])
-        for j,mask in enumerate(masks):
-            mask = mask - masks_combine
-            mask_indices = np.where(mask == 255)
-            colors = target_img[mask_indices]
+        for j, mask in enumerate(masks):
+            visible = (mask > 0) & (masks_combine == 0)
+            colors = target_img[visible]
             color_tuples = [tuple(color) for color in colors]
             color_counts = Counter(color_tuples)
             if color_counts:
                 most_common_color = color_counts.most_common(1)[0][0]
             else:
-                most_common_color = (0,0,0)
+                # Fallback to full mask if completely occluded
+                full_colors = target_img[mask > 0]
+                if len(full_colors) > 0:
+                    most_common_color = Counter([tuple(c) for c in full_colors]).most_common(1)[0][0]
+                else:
+                    most_common_color = (0, 0, 0)
             most_common_color_list.append(list(most_common_color))
-    for i,shape_group in enumerate(shape_groups):
-        shape_group.fill_color=torch.FloatTensor(most_common_color_list[i]+[255])/255
-    return shape_groups,target_img
+    for i, shape_group in enumerate(shape_groups):
+        shape_group.fill_color = torch.FloatTensor(most_common_color_list[i] + [255]) / 255
+    return shape_groups, target_img
 
 def select_mask_by_conn_area(
         pred: np.ndarray,
@@ -817,3 +880,277 @@ def remove_lowquality_paths(shapes, shape_groups,device,
     for i in range(len(shape_groups)):
         shape_groups[i].shape_ids=torch.tensor([i])
     return shapes,shape_groups
+
+
+def compute_depth_map(
+    device: torch.device,
+    target_img: np.ndarray,
+    model_id: str = "depth-anything/Depth-Anything-V2-Small-hf",
+) -> np.ndarray:
+    """Compute a normalized relative depth/disparity map in [0, 1] (higher = closer)."""
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = AutoModelForDepthEstimation.from_pretrained(model_id).to(device)
+    model.eval()
+
+    pil_img = Image.fromarray(target_img.astype(np.uint8))
+    inputs = processor(images=pil_img, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predicted_depth = outputs.predicted_depth
+
+    h, w = target_img.shape[:2]
+    depth = F.interpolate(
+        predicted_depth.unsqueeze(1),
+        size=(h, w),
+        mode="bicubic",
+        align_corners=False,
+    ).squeeze().cpu().numpy()
+
+    del model, processor, inputs, outputs, predicted_depth
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    d_min, d_max = float(depth.min()), float(depth.max())
+    if d_max > d_min:
+        depth = (depth - d_min) / (d_max - d_min)
+    else:
+        depth = np.zeros((h, w), dtype=np.float32)
+    return depth.astype(np.float32)
+
+
+def order_masks_by_depth(layerd_struct_masks: list, depth_map: np.ndarray) -> list:
+    """Flatten deduplicated masks into a strict far->near z-order using median depth,
+    while keeping the base canvas mask at index 0 and inner/contained masks above parents."""
+    flat_masks = [m for layer in layerd_struct_masks for m in layer]
+    if len(flat_masks) <= 2:
+        return [[m] for m in flat_masks]
+
+    base_mask = flat_masks[0]
+    rest = flat_masks[1:]
+
+    items = []
+    for m in rest:
+        fg = m > 0
+        area = int(np.sum(fg))
+        med_depth = float(np.median(depth_map[fg])) if area > 0 else 0.0
+        items.append({"mask": m, "fg": fg, "area": area, "depth": med_depth})
+
+    # Far -> near (ascending disparity), ties broken by larger area first
+    items.sort(key=lambda x: (x["depth"], -x["area"]))
+
+    # Enforce strict containment: if inner mask B is >=85% inside larger mask A, B must come after A
+    n = len(items)
+    changed = True
+    max_passes = n
+    passes = 0
+    while changed and passes < max_passes:
+        changed = False
+        passes += 1
+        for i in range(n):
+            for j in range(i + 1, n):
+                if items[i]["area"] < items[j]["area"]:
+                    inter = int(np.sum(items[i]["fg"] & items[j]["fg"]))
+                    if items[i]["area"] > 0 and (inter / items[i]["area"]) >= 0.85:
+                        # Move inner mask i right after enclosing mask j
+                        inner = items.pop(i)
+                        items.insert(j, inner)
+                        changed = True
+                        break
+            if changed:
+                break
+
+    ordered = [base_mask] + [it["mask"] for it in items]
+    return [[m] for m in ordered]
+
+
+def init_composite_struct_target(ordered_masks: list, device: torch.device):
+    """Build one bottom-to-top random-color composite target, matching ShapeGroups,
+    and per-shape visible_masks (1 where not occluded by any higher mask j > i)."""
+    h, w = ordered_masks[0].shape[:2]
+    composite = torch.zeros((3, h, w), dtype=torch.float32)
+    struct_shape_groups = []
+
+    for i, mask in enumerate(ordered_masks):
+        color = [float(0.2 + 0.8 * torch.rand(1).item()) for _ in range(3)]
+        fg = torch.from_numpy((mask > 0).astype(np.float32))
+        for c in range(3):
+            composite[c] = composite[c] * (1.0 - fg) + color[c] * fg
+        struct_shape_groups.append(
+            pydiffvg.ShapeGroup(
+                shape_ids=torch.LongTensor([i]),
+                fill_color=torch.FloatTensor(color + [1.0]),
+                stroke_color=torch.FloatTensor([0.0, 0.0, 0.0, 1.0]),
+            )
+        )
+
+    # Reverse cumulative union of higher masks -> visible_mask[i] = 1 - union(j > i)
+    visible_masks = [None] * len(ordered_masks)
+    occluded_above = np.zeros((h, w), dtype=bool)
+    for i in range(len(ordered_masks) - 1, -1, -1):
+        visible_masks[i] = torch.from_numpy((~occluded_above).astype(np.float32)).to(device)
+        occluded_above |= ordered_masks[i] > 0
+
+    return composite.to(device), struct_shape_groups, visible_masks
+
+
+def compute_geometric_loss(
+    shapes: list,
+    is_opt_list: Optional[List[int]] = None,
+    min_seg_ratio: float = 0.25,
+    short_seg_weight: float = 0.01,
+    handle_asym_weight: float = 0.005,
+    smooth_cos_thresh: float = -0.5,
+    elastica_weight: float = 0.0,
+    elastica_length_weight: float = 0.2,
+    elastica_curv_weight: float = 1.0,
+):
+    """Scale-proportional geometric regularization for closed cubic Bezier paths.
+
+    1. Penalizes segments whose anchor-to-anchor length drops below
+       `min_seg_ratio * mean_seg_len` (proportional to each shape's own size).
+    2. Penalizes asymmetric incoming/outgoing handle lengths on smooth nodes.
+    3. Optional scale-normalized Euler's Elastica smoothness (length + curvature^2)
+       so occluded/bridged spans relax smoothly.
+    """
+    short_losses = []
+    handle_losses = []
+    elastica_losses = []
+    t_samples = None
+
+    for i, path in enumerate(shapes):
+        if is_opt_list is not None and len(is_opt_list) > 0 and is_opt_list[i] == 0:
+            continue
+        pts = path.points
+        if not pts.requires_grad:
+            continue
+        if pts.shape[0] < 9 or pts.shape[0] % 3 != 0:
+            continue
+        if not torch.all(path.num_control_points == 2):
+            continue
+
+        anchors = pts[0::3]  # (N, 2)
+        next_anchors = torch.roll(anchors, shifts=-1, dims=0)
+        seg_vecs = next_anchors - anchors
+        seg_lens = torch.sqrt((seg_vecs ** 2).sum(dim=-1) + 1e-8)  # (N,)
+
+        mean_seg_len = seg_lens.mean().detach().clamp(min=1e-3)
+        min_len = min_seg_ratio * mean_seg_len
+        short_pen = (F.relu(min_len - seg_lens) / mean_seg_len).pow(2).mean()
+        short_losses.append(short_pen)
+
+        h_out = pts[1::3] - anchors
+        h_in = torch.roll(pts[2::3], shifts=1, dims=0) - anchors
+        len_out = torch.sqrt((h_out ** 2).sum(dim=-1) + 1e-8)
+        len_in = torch.sqrt((h_in ** 2).sum(dim=-1) + 1e-8)
+
+        cos_angle = ((h_in * h_out).sum(dim=-1) / (len_in * len_out + 1e-8)).clamp(-1.0, 1.0)
+        # 1.0 when handles are collinear & opposite (cos == -1), 0.0 at sharp corners
+        denom = max(1.0 + smooth_cos_thresh, 1e-6)
+        smooth_weight = (F.relu(-cos_angle + smooth_cos_thresh) / denom).detach()
+        handle_pen = (smooth_weight * ((len_out - len_in) / mean_seg_len).pow(2)).mean()
+        handle_losses.append(handle_pen)
+
+        if elastica_weight > 0.0:
+            if t_samples is None or t_samples.device != pts.device or t_samples.dtype != pts.dtype:
+                t_samples = torch.linspace(0.1, 0.9, 8, device=pts.device, dtype=pts.dtype).view(1, -1, 1)
+            omt = 1.0 - t_samples
+            p0 = anchors.unsqueeze(1)
+            p1 = pts[1::3].unsqueeze(1)
+            p2 = pts[2::3].unsqueeze(1)
+            p3 = next_anchors.unsqueeze(1)
+
+            d1 = 3.0 * (omt ** 2) * (p1 - p0) + 6.0 * omt * t_samples * (p2 - p1) + 3.0 * (t_samples ** 2) * (p3 - p2)
+            d2 = 6.0 * omt * (p2 - 2.0 * p1 + p0) + 6.0 * t_samples * (p3 - 2.0 * p2 + p1)
+
+            d1_n = d1 / mean_seg_len
+            d2_n = d2 / mean_seg_len
+            speed_sq = (d1_n ** 2).sum(dim=-1) + 1e-4
+            speed = torch.sqrt(speed_sq)
+            cross = torch.abs(d1_n[..., 0] * d2_n[..., 1] - d1_n[..., 1] * d2_n[..., 0])
+            kappa = (cross / (speed_sq * speed)).clamp(max=10.0)
+            elastica_pen = ((elastica_length_weight + elastica_curv_weight * (kappa ** 2)) * speed).mean()
+            elastica_losses.append(elastica_pen)
+
+    if len(short_losses) == 0:
+        return 0.0
+
+    total = short_seg_weight * torch.stack(short_losses).mean() + handle_asym_weight * torch.stack(handle_losses).mean()
+    if elastica_weight > 0.0 and len(elastica_losses) > 0:
+        total = total + elastica_weight * torch.stack(elastica_losses).mean()
+    return total
+
+
+def subdivide_bezier_segment(path: pydiffvg.Path, seg_idx: int) -> pydiffvg.Path:
+    """Exact midpoint (t=0.5) De Casteljau split of one cubic segment in a closed path."""
+    pts = path.points.detach()
+    num_segs = pts.shape[0] // 3
+    k = seg_idx % num_segs
+    k_next = (k + 1) % num_segs
+
+    p0 = pts[3 * k]
+    p1 = pts[3 * k + 1]
+    p2 = pts[3 * k + 2]
+    p3 = pts[3 * k_next]
+
+    q0 = 0.5 * (p0 + p1)
+    q1 = 0.5 * (p1 + p2)
+    q2 = 0.5 * (p2 + p3)
+    r0 = 0.5 * (q0 + q1)
+    r1 = 0.5 * (q1 + q2)
+    mid = 0.5 * (r0 + r1)
+
+    split_block = torch.stack([p0, q0, r0, mid, r1, q2], dim=0)
+    new_pts = torch.cat([pts[: 3 * k], split_block, pts[3 * k + 3 :]], dim=0).clone()
+
+    new_path = pydiffvg.Path(
+        num_control_points=torch.LongTensor([2] * (num_segs + 1)),
+        points=new_pts,
+        stroke_width=path.stroke_width.detach().clone(),
+        is_closed=path.is_closed,
+    )
+    return new_path
+
+
+@torch.no_grad()
+def select_worst_segment_for_shape(
+    path: pydiffvg.Path,
+    err_map: torch.Tensor,
+    num_samples: int = 9,
+    normal_offsets: tuple = (0.0, -2.0, 2.0, -5.0, 5.0),
+    visible_mask: Optional[torch.Tensor] = None,
+):
+    """Return (worst_seg_idx, max_local_error) by sampling err_map along each cubic segment."""
+    pts = path.points.detach().to(err_map.device)
+    num_segs = pts.shape[0] // 3
+    if num_segs == 0 or pts.shape[0] % 3 != 0:
+        return -1, 0.0
+
+    eval_err = err_map * visible_mask if visible_mask is not None else err_map
+
+    h, w = eval_err.shape
+    t = torch.linspace(0.1, 0.9, num_samples, device=eval_err.device, dtype=pts.dtype).view(1, -1, 1)
+    omt = 1.0 - t
+
+    idx = torch.arange(num_segs, device=eval_err.device)
+    p0 = pts[3 * idx].unsqueeze(1)
+    p1 = pts[3 * idx + 1].unsqueeze(1)
+    p2 = pts[3 * idx + 2].unsqueeze(1)
+    p3 = pts[3 * ((idx + 1) % num_segs)].unsqueeze(1)
+
+    # Cubic Bezier points B(t) and tangents B'(t): shape (N, S, 2)
+    curve = (omt ** 3) * p0 + 3 * (omt ** 2) * t * p1 + 3 * omt * (t ** 2) * p2 + (t ** 3) * p3
+    tangent = 3 * (omt ** 2) * (p1 - p0) + 6 * omt * t * (p2 - p1) + 3 * (t ** 2) * (p3 - p2)
+    tang_norm = torch.sqrt((tangent ** 2).sum(dim=-1, keepdim=True) + 1e-8)
+    normal = torch.stack([-tangent[..., 1], tangent[..., 0]], dim=-1) / tang_norm
+
+    offsets = torch.tensor(normal_offsets, device=eval_err.device, dtype=pts.dtype).view(1, 1, -1, 1)
+    sample_pts = curve.unsqueeze(2) + offsets * normal.unsqueeze(2)  # (N, S, O, 2)
+
+    xs = sample_pts[..., 0].round().long().clamp(0, w - 1)
+    ys = sample_pts[..., 1].round().long().clamp(0, h - 1)
+    seg_errors = eval_err[ys, xs].mean(dim=(1, 2))  # (N,)
+
+    max_err, worst_seg = torch.max(seg_errors, dim=0)
+    return int(worst_seg.item()), float(max_err.item())
