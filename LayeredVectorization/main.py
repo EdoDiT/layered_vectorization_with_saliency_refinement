@@ -269,6 +269,13 @@ def layered_vectorization(args,device=None):
             straighten_segments=getattr(args, "is_straighten_concave_segments", False),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/concave_simplified.svg",img_height,img_width,shapes,shape_groups)
+    if args.color_fitting_type not in ["dominan","mse"]:
+        raise ValueError(f"args.color_fitting_type can only be 'dominan' or 'mse', but the values passed in are {args.color_fitting_type}")
+    if args.color_fitting_type == "dominan":
+        shape_groups,target_img_cluster = color_fitting(shape_groups, target_img, layerd_struct_masks, args.is_cluster_target_img, args.kmeas_k)
+        target_img_cluster_ = Image.fromarray(target_img_cluster)
+        target_img_cluster_.save(f"./workdir/{args.file_save_name}/cluster_img.png")
+        pydiffvg.save_svg(f"./workdir/{args.file_save_name}/color-adjusted.svg",img_height,img_width,shapes,shape_groups)
     if getattr(args, "is_merge_struct", True):
         print("Structural Shape Merging...")
         shapes,shape_groups,layerd_struct_masks = merge_struct_shapes(
@@ -284,13 +291,6 @@ def layered_vectorization(args,device=None):
             sse_threshold=getattr(args, "struct_merge_sse_threshold", 25.0),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/struct_merged.svg",img_height,img_width,shapes,shape_groups)
-    if args.color_fitting_type not in ["dominan","mse"]:
-        raise ValueError(f"args.color_fitting_type can only be 'dominan' or 'mse', but the values passed in are {args.color_fitting_type}")
-    if args.color_fitting_type == "dominan":
-        shape_groups,target_img_cluster = color_fitting(shape_groups, target_img, layerd_struct_masks, args.is_cluster_target_img, args.kmeas_k)
-        target_img_cluster_ = Image.fromarray(target_img_cluster)
-        target_img_cluster_.save(f"./workdir/{args.file_save_name}/cluster_img.png")
-        pydiffvg.save_svg(f"./workdir/{args.file_save_name}/color-adjusted.svg",img_height,img_width,shapes,shape_groups)
 
     print("Visual Refinement...")
     pseudo_struct_masks = [mask for sublist in layerd_struct_masks for mask in sublist]

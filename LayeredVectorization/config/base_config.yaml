@@ -18,7 +18,7 @@ concave_sse_threshold: 1.0
 concave_max_changed_pct: 0.0015
 is_straighten_concave_segments: False
 
-# Structural shape merging phase (after concave simplification, before color fitting)
+# Structural shape merging phase (after color fitting, before visual refinement)
 is_merge_struct: True
 struct_merge_distance_threshold: 60.0
 struct_merge_max_stack_gap_pct: 0.20
