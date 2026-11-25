@@ -186,32 +186,61 @@ def svg_optimize_img_struct(device, shapes, shape_groups,
             _run_opt_steps(svg_optimizer, train_conf["struct_opt_num_iters"], 0, pbar)
         return shapes, shape_groups
 
-    initial_iters = coarse_conf.get("coarse_initial_iters", 30)
-    refine_iters = coarse_conf.get("coarse_refine_iters", 15)
-    max_split_rounds = coarse_conf.get("coarse_max_split_rounds", 5)
-    split_err_thresh = coarse_conf.get("coarse_split_error_threshold", 0.005)
+    initial_iters = coarse_conf.get("coarse_initial_iters", 25)
+    refine_iters = coarse_conf.get("coarse_refine_iters", 12)
+    max_split_rounds = coarse_conf.get("coarse_max_split_rounds", 8)
+    split_err_thresh = coarse_conf.get("coarse_split_error_threshold", 0.06)
+    max_segments = coarse_conf.get("coarse_max_segments", 24)
+    max_splits_per_round = coarse_conf.get("coarse_max_splits_per_round", 2)
+    snap_radius = coarse_conf.get("coarse_snap_radius", 30)
     max_total_iters = initial_iters + max_split_rounds * refine_iters
+
+    # Boundary points of each shape's target mask (same order as `shapes`), used to snap new anchors
+    flat_masks = [m for layer in layerd_struct_masks for m in layer]
+    mask_contours = []
+    for m in flat_masks:
+        cnts, _ = cv2.findContours((m > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        mask_contours.append(np.vstack(cnts).reshape(-1, 2).astype(np.float32) if len(cnts) > 0 else None)
+
+    settled = set()  # shapes whose segments are all below the error threshold are not checked again
+
+    def _split_shape(global_i, err_map, visible_mask=None):
+        """Split the worst segments (error above threshold) of one shape. Returns the number of splits."""
+        if global_i in settled:
+            return 0
+        seg_errors = compute_segment_errors(shapes[global_i], err_map, visible_mask=visible_mask)
+        num_segs = shapes[global_i].points.shape[0] // 3
+        if seg_errors is None:
+            settled.add(global_i)
+            return 0
+        bad = torch.nonzero(seg_errors > split_err_thresh).flatten()
+        if len(bad) == 0 or num_segs >= max_segments:
+            settled.add(global_i)
+            return 0
+        worst_first = bad[torch.argsort(seg_errors[bad], descending=True)]
+        to_split = worst_first[:min(max_splits_per_round, max_segments - num_segs)].tolist()
+        for seg in sorted(to_split, reverse=True):  # high -> low index keeps the remaining indices valid
+            shapes[global_i] = subdivide_bezier_segment(shapes[global_i], seg,
+                                                        snap_contour=mask_contours[global_i],
+                                                        snap_radius=snap_radius)
+        return len(to_split)
 
     iter_offset = 0
     with tqdm(total=max_total_iters, desc="Structural coarse-to-fine", unit="iter") as pbar:
         iter_offset = _run_opt_steps(svg_optimizer, initial_iters, iter_offset, pbar)
 
         for round_idx in range(max_split_rounds):
-            split_count = 0
+            shapes_split = 0
+            new_segments = 0
             with torch.no_grad():
                 if is_depth_ordered:
                     struct_img = svg_to_img(img_width, img_height, shapes, composite_shape_groups, device)
                     struct_img = rgba_to_rgb(struct_img, device, black_bg)
                     err_map = (struct_img - composite_target).pow(2).mean(dim=0)
                     for global_i in range(len(shapes)):
-                        worst_seg, max_err = select_worst_segment_for_shape(
-                            shapes[global_i],
-                            err_map,
-                            visible_mask=visible_masks[global_i],
-                        )
-                        if worst_seg >= 0 and max_err > split_err_thresh:
-                            shapes[global_i] = subdivide_bezier_segment(shapes[global_i], worst_seg)
-                            split_count += 1
+                        n = _split_shape(global_i, err_map, visible_masks[global_i])
+                        shapes_split += int(n > 0)
+                        new_segments += n
                 else:
                     shape_index = 0
                     for struct_i, struct_target_img in enumerate(struct_target_imgs):
@@ -225,14 +254,17 @@ def svg_optimize_img_struct(device, shapes, shape_groups,
                         err_map = (struct_img - struct_target_img).pow(2).mean(dim=0)
 
                         for local_i in range(layer_len):
-                            global_i = shape_index + local_i
-                            worst_seg, max_err = select_worst_segment_for_shape(shapes[global_i], err_map)
-                            if worst_seg >= 0 and max_err > split_err_thresh:
-                                shapes[global_i] = subdivide_bezier_segment(shapes[global_i], worst_seg)
-                                split_count += 1
+                            n = _split_shape(shape_index + local_i, err_map)
+                            shapes_split += int(n > 0)
+                            new_segments += n
                         shape_index += layer_len
 
-            if split_count == 0:
+            seg_counts = [s.points.shape[0] // 3 for s in shapes]
+            tqdm.write(f"[coarse-to-fine] round {round_idx + 1}: split {shapes_split}/{len(shapes)} shapes "
+                       f"(+{new_segments} segments), {len(settled)} settled, "
+                       f"avg {np.mean(seg_counts):.1f} / max {max(seg_counts)} segments per shape")
+
+            if shapes_split == 0:
                 pbar.total = iter_offset
                 pbar.refresh()
                 break
@@ -360,10 +392,13 @@ def layered_vectorization(args,device=None):
     coarse_conf = {
         "is_coarse_to_fine": getattr(args, "is_coarse_to_fine", True),
         "coarse_init_max_segments": getattr(args, "coarse_init_max_segments", 4),
-        "coarse_max_split_rounds": getattr(args, "coarse_max_split_rounds", 12),
+        "coarse_max_split_rounds": getattr(args, "coarse_max_split_rounds", 8),
         "coarse_initial_iters": getattr(args, "coarse_initial_iters", 25),
-        "coarse_refine_iters": getattr(args, "coarse_refine_iters", 10),
-        "coarse_split_error_threshold": getattr(args, "coarse_split_error_threshold", 0.003),
+        "coarse_refine_iters": getattr(args, "coarse_refine_iters", 12),
+        "coarse_split_error_threshold": getattr(args, "coarse_split_error_threshold", 0.06),
+        "coarse_max_segments": getattr(args, "coarse_max_segments", 24),
+        "coarse_max_splits_per_round": getattr(args, "coarse_max_splits_per_round", 2),
+        "coarse_snap_radius": getattr(args, "coarse_snap_radius", 30),
     }
     geom_conf = {
         "is_geom_loss": getattr(args, "is_geom_loss", True),

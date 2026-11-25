@@ -21,10 +21,16 @@ depth_model_id: "depth-anything/Depth-Anything-V2-Small-hf"
 # Coarse-to-fine structural control point scheduling ("squinting")
 is_coarse_to_fine: True
 coarse_init_max_segments: 4
-coarse_max_split_rounds: 12
+coarse_max_split_rounds: 8
 coarse_initial_iters: 25
-coarse_refine_iters: 10
-coarse_split_error_threshold: 0.003
+coarse_refine_iters: 12
+# Mean segment error above which a segment is split. A mismatched pixel costs ~0.4 and a perfect
+# boundary reads ~0.01-0.02, so ~0.06 is roughly a 1.5px misalignment. Lower = more segments.
+coarse_split_error_threshold: 0.06
+coarse_max_segments: 24
+coarse_max_splits_per_round: 2
+# New anchors are snapped onto the mask contour if it is within this many pixels
+coarse_snap_radius: 30
 
 # Scale-proportional geometric regularization (short segments, asymmetric handles, elastica)
 is_geom_loss: True

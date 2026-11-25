@@ -1082,8 +1082,17 @@ def compute_geometric_loss(
     return total
 
 
-def subdivide_bezier_segment(path: pydiffvg.Path, seg_idx: int) -> pydiffvg.Path:
-    """Exact midpoint (t=0.5) De Casteljau split of one cubic segment in a closed path."""
+def subdivide_bezier_segment(
+    path: pydiffvg.Path,
+    seg_idx: int,
+    snap_contour: Optional[np.ndarray] = None,
+    snap_radius: float = 0.0,
+) -> pydiffvg.Path:
+    """Midpoint (t=0.5) De Casteljau split of one cubic segment in a closed path.
+
+    The split itself preserves the curve exactly. If `snap_contour` (M, 2) is given, the new anchor
+    (together with its two handles) is then translated onto the closest contour point, provided it is
+    within `snap_radius` pixels, so the new control point starts on the silhouette instead of on the chord."""
     pts = path.points.detach()
     num_segs = pts.shape[0] // 3
     k = seg_idx % num_segs
@@ -1104,6 +1113,15 @@ def subdivide_bezier_segment(path: pydiffvg.Path, seg_idx: int) -> pydiffvg.Path
     split_block = torch.stack([p0, q0, r0, mid, r1, q2], dim=0)
     new_pts = torch.cat([pts[: 3 * k], split_block, pts[3 * k + 3 :]], dim=0).clone()
 
+    if snap_contour is not None and snap_radius > 0 and len(snap_contour) > 0:
+        mid_idx = 3 * k + 3  # new anchor; handles sit at mid_idx - 1 and mid_idx + 1
+        mid_np = new_pts[mid_idx].cpu().numpy()
+        dist_sq = ((snap_contour - mid_np) ** 2).sum(axis=1)
+        nearest = int(np.argmin(dist_sq))
+        if dist_sq[nearest] <= snap_radius ** 2:
+            delta = torch.from_numpy((snap_contour[nearest] - mid_np).astype(np.float32))
+            new_pts[mid_idx - 1 : mid_idx + 2] += delta.to(device=new_pts.device, dtype=new_pts.dtype)
+
     new_path = pydiffvg.Path(
         num_control_points=torch.LongTensor([2] * (num_segs + 1)),
         points=new_pts,
@@ -1114,18 +1132,22 @@ def subdivide_bezier_segment(path: pydiffvg.Path, seg_idx: int) -> pydiffvg.Path
 
 
 @torch.no_grad()
-def select_worst_segment_for_shape(
+def compute_segment_errors(
     path: pydiffvg.Path,
     err_map: torch.Tensor,
     num_samples: int = 9,
     normal_offsets: tuple = (0.0, -2.0, 2.0, -5.0, 5.0),
     visible_mask: Optional[torch.Tensor] = None,
 ):
-    """Return (worst_seg_idx, max_local_error) by sampling err_map along each cubic segment."""
+    """Mean residual error of each cubic segment (tensor of shape (num_segs,)), obtained by sampling
+    err_map along the curve and a small band around it. Returns None for degenerate paths.
+
+    Reference values for the layer error maps (random colors in [0.2, 1] on black): a mismatched pixel
+    costs ~0.4, and a perfectly fitted boundary still reads ~0.01-0.02 (antialiasing)."""
     pts = path.points.detach().to(err_map.device)
     num_segs = pts.shape[0] // 3
     if num_segs == 0 or pts.shape[0] % 3 != 0:
-        return -1, 0.0
+        return None
 
     eval_err = err_map * visible_mask if visible_mask is not None else err_map
 
@@ -1152,5 +1174,4 @@ def select_worst_segment_for_shape(
     ys = sample_pts[..., 1].round().long().clamp(0, h - 1)
     seg_errors = eval_err[ys, xs].mean(dim=(1, 2))  # (N,)
 
-    max_err, worst_seg = torch.max(seg_errors, dim=0)
-    return int(worst_seg.item()), float(max_err.item())
+    return seg_errors
