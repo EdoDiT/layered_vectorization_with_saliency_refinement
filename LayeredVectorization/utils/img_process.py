@@ -1486,23 +1486,121 @@ def _cutout_bezier_shape(path_k: pydiffvg.Path, path_j: pydiffvg.Path) -> List[p
     return result_paths if result_paths else [path_k]
 
 
+def _union_bezier_shapes(path1: pydiffvg.Path, path2: pydiffvg.Path) -> List[pydiffvg.Path]:
+    """
+    Compute the exact outer Bezier silhouette union (path1 U path2) of two overlapping shapes
+    by subdividing both paths at their boundary crossings and splicing their exterior segments.
+    """
+    pts1_t = path1.points.detach()
+    pts2_t = path2.points.detach()
+    if (pts1_t.shape[0] // 3) < 3 or (pts2_t.shape[0] // 3) < 3:
+        return []
+
+    orient1 = _get_path_orientation(pts1_t)
+    orient2 = _get_path_orientation(pts2_t)
+    if orient1 == 0.0 or orient2 == 0.0:
+        return []
+
+    same_pts2_t = _reverse_cubic_path_points(pts2_t) if (orient1 * orient2 < 0) else pts2_t.clone()
+    pts1 = pts1_t.cpu().numpy().astype(np.float32)
+    pts2 = same_pts2_t.cpu().numpy().astype(np.float32)
+
+    poly1 = _sample_bezier_points(pts1_t)
+    poly2 = _sample_bezier_points(same_pts2_t)
+
+    sub1 = _subdivide_path_at_poly_boundary(pts1, poly2, want_inside=False)
+    sub2 = _subdivide_path_at_poly_boundary(pts2, poly1, want_inside=False)
+    chains1, all1 = _extract_kept_chains(sub1)
+    chains2, all2 = _extract_kept_chains(sub2)
+
+    # If one shape is completely inside the other, the outer silhouette is just the enclosing shape
+    if len(chains1) == 0:
+        return [
+            pydiffvg.Path(
+                num_control_points=path2.num_control_points.detach().clone(),
+                points=same_pts2_t,
+                stroke_width=path1.stroke_width.detach().clone(),
+                is_closed=path1.is_closed,
+            )
+        ]
+    if len(chains2) == 0:
+        return [path1]
+    if all1 or all2:
+        return []
+
+    device = pts1_t.device
+    dtype = pts1_t.dtype
+    used1 = [False] * len(chains1)
+    used2 = [False] * len(chains2)
+    s1 = np.array([c[0][0] for c in chains1])
+    s2 = np.array([c[0][0] for c in chains2])
+    best_path = None
+    best_area = -1.0
+
+    for start1 in range(len(chains1)):
+        if used1[start1]:
+            continue
+        cycle = []
+        curr1 = start1
+        while not used1[curr1]:
+            used1[curr1] = True
+            cycle.append(chains1[curr1])
+            end1 = chains1[curr1][-1][3]
+            avail2 = [idx for idx, u in enumerate(used2) if not u]
+            if not avail2:
+                break
+            d2 = [float(np.linalg.norm(s2[idx] - end1)) for idx in avail2]
+            best2 = avail2[int(np.argmin(d2))]
+            used2[best2] = True
+            cycle.append(chains2[best2])
+            end2 = chains2[best2][-1][3]
+            d1 = np.linalg.norm(s1 - end2, axis=-1)
+            next1 = int(np.argmin(d1))
+            if next1 == start1 or used1[next1]:
+                break
+            curr1 = next1
+
+        cand = _chains_to_bezier_path(cycle, device, dtype, path1.stroke_width, path1.is_closed)
+        if cand is not None:
+            poly = _sample_bezier_points(cand.points)
+            if len(poly) >= 3:
+                pn = np.roll(poly, -1, axis=0)
+                area = abs(0.5 * float(np.sum(poly[:, 0] * pn[:, 1] - pn[:, 0] * poly[:, 1])))
+                if area > best_area:
+                    best_area = area
+                    best_path = cand
+
+    return [best_path] if best_path is not None else []
+
+
+def _shape_bbox_size(pts_np: np.ndarray) -> float:
+    """Return the 2D bounding-box diagonal of a sampled Bezier curve."""
+    if len(pts_np) == 0:
+        return 0.0
+    w = float(pts_np[:, 0].max() - pts_np[:, 0].min())
+    h = float(pts_np[:, 1].max() - pts_np[:, 1].min())
+    return float(np.hypot(w, h))
+
+
 def merge_struct_shapes(
     device,
     shapes: list,
     shape_groups: list,
     target_img: np.ndarray,
     layerd_struct_masks: list = None,
-    distance_threshold: float = 60.0,
-    color_range_pct: float = 0.05,
+    distance_scale: float = 0.60,
+    color_range_pct: float = 0.10,
+    min_overlap_pct: float = 0.05,
     max_area_change_pct: float = 0.07,
 ):
     """
-    Merge structural shapes anywhere in the stack that are spatially close or overlapping
-    and have very similar colors.
-    Merged shapes (i < j) are bridged via their outer convex-hull common tangents and placed at
-    the lower stack index i with an area-weighted average color. Every intermediate shape k in (i, j)
-    that overlaps j has j cut out of it (deleting k if fully covered, or replacing k with 1 or more
-    cut Bezier shapes) so j remains visible from level i without being covered.
+    Merge structural shapes anywhere in the stack that are spatially close (within distance_scale
+    times the larger shape's bounding-box diagonal) or overlapping, and have similar colors.
+    When two shapes overlap by at least min_overlap_pct of the smaller shape's area, they are
+    merged along their exact outer Bezier silhouette union; otherwise (disjoint or barely touching)
+    they are bridged via their outer convex-hull common tangents.
+    Every intermediate shape k in (i, j) that overlaps j has j cut out of it so j remains visible
+    from level i without being covered.
     """
     flat_masks = []
     flat_layer_ids = []
@@ -1533,53 +1631,58 @@ def merge_struct_shapes(
         alphas = []
         areas = []
         sampled_curves = []
+        shape_sizes = []
         for shape in shapes:
             alpha = _render_alpha_mask(img_width, img_height, [shape], device)
             area = max(int(torch.sum(alpha).item()), 1)
+            sc = _sample_bezier_points(shape.points)
             alphas.append(alpha)
             areas.append(area)
-            sampled_curves.append(_sample_bezier_points(shape.points))
+            sampled_curves.append(sc)
+            shape_sizes.append(_shape_bbox_size(sc))
 
         # Keep index 0 (full-canvas background) intact; iteratively merge shapes 1..N-1 across the entire stack
-        tried_pairs = set()
+        # Scan pairs bottom-to-top; after every accepted merge restart from i = 1 so that all rejected
+        # pairs are re-evaluated against the updated stack. The pass ends when a full scan accepts nothing.
         changed = True
         while changed:
             changed = False
             i = 1
             while i < len(shapes):
-                j = i + 1
-                merged_any = False
-                while j < len(shapes):
-                    pair_key = (id(shapes[i]), id(shapes[j]))
-                    if pair_key in tried_pairs:
-                        j += 1
-                        continue
+                c_i = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
+                pts_i = sampled_curves[i]
+                if len(pts_i) == 0:
+                    i += 1
+                    continue
 
-                    c_i = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
-                    c_j = np.clip(shape_groups[j].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
-
-                    # 1. Contrast-aware per-channel color similarity
+                # Find all candidate j > i matching color and dynamic distance, ordered by closest distance first
+                cand_js = []
+                for j_idx in range(i + 1, len(shapes)):
+                    c_j = np.clip(shape_groups[j_idx].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
                     if np.any(np.abs(c_i - c_j) > channel_thresholds):
-                        j += 1
                         continue
-
-                    # 2. Spatial closeness check between Bezier curves
-                    pts_i = sampled_curves[i]
-                    pts_j = sampled_curves[j]
-                    if len(pts_i) == 0 or len(pts_j) == 0:
-                        j += 1
+                    pts_j = sampled_curves[j_idx]
+                    if len(pts_j) == 0:
                         continue
                     min_dist = float(np.min(cdist(pts_i, pts_j)))
-                    if min_dist > distance_threshold:
-                        j += 1
-                        continue
+                    max_dist = distance_scale * max(shape_sizes[i], shape_sizes[j_idx])
+                    if min_dist <= max_dist:
+                        cand_js.append((min_dist, j_idx))
 
-                    tried_pairs.add(pair_key)
+                cand_js.sort(key=lambda x: x[0])
+                merged_any = False
+                for _, j in cand_js:
+                    c_j = np.clip(shape_groups[j].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
 
-                    # 3. Generate convex-hull tangent-bridged Bezier candidates
-                    candidates = _generate_convex_bridge_candidates(shapes[i], shapes[j])
+                    # 3. If shapes overlap by >= min_overlap_pct of the smaller shape, follow their exact
+                    #    outer silhouette union; only bridge with convex-hull tangents when disjoint / barely touching
+                    ov_ij = int(torch.sum(alphas[i] & alphas[j]).item())
+                    overlap_ratio = ov_ij / float(max(min(areas[i], areas[j]), 1))
+                    if overlap_ratio >= min_overlap_pct:
+                        candidates = _union_bezier_shapes(shapes[i], shapes[j])
+                    else:
+                        candidates = _generate_convex_bridge_candidates(shapes[i], shapes[j])
                     if not candidates:
-                        j += 1
                         continue
 
                     # Visible area of shapes i and j before merging
@@ -1593,7 +1696,6 @@ def merge_struct_shapes(
                     vis_j = alphas[j] & (~upper_j)
                     vis_area = int(torch.sum(vis_i | vis_j).item())
                     if vis_area <= 0:
-                        j += 1
                         continue
 
                     # 4. Cut out top shape j from any intermediate shape k in (i, j) that overlaps j
@@ -1603,6 +1705,7 @@ def merge_struct_shapes(
                     mid_alphas = []
                     mid_areas = []
                     mid_sampled = []
+                    mid_sizes = []
                     mid_masks = []
                     mid_lids = []
                     mask_j_inv_u8 = None
@@ -1621,6 +1724,7 @@ def merge_struct_shapes(
                             mid_alphas.append(alphas[k])
                             mid_areas.append(areas[k])
                             mid_sampled.append(sampled_curves[k])
+                            mid_sizes.append(shape_sizes[k])
                             if has_valid_masks:
                                 mid_masks.append(flat_masks[k])
                                 mid_lids.append(flat_layer_ids[k])
@@ -1630,17 +1734,22 @@ def merge_struct_shapes(
                         else:
                             # Case 3: Partially overlaps j -> cut j out of k (can produce 0, 1, or more shapes)
                             cut_paths = _cutout_bezier_shape(shapes[k], shapes[j])
+                            valid_rem = alphas[k] & (~alphas[j])
                             for cp in cut_paths:
                                 cp_alpha = _render_alpha_mask(img_width, img_height, [cp], device)
                                 cp_area = int(torch.sum(cp_alpha).item())
                                 if cp_area < 4:
                                     continue
+                                if int(torch.sum(cp_alpha & valid_rem).item()) < int(0.8 * cp_area):
+                                    continue
+                                cp_sc = _sample_bezier_points(cp.points)
                                 mid_shapes.append(cp)
                                 mid_fills.append(shape_groups[k].fill_color.detach().clone())
                                 mid_strokes.append(shape_groups[k].stroke_color.detach().clone())
                                 mid_alphas.append(cp_alpha)
                                 mid_areas.append(cp_area)
-                                mid_sampled.append(_sample_bezier_points(cp.points))
+                                mid_sampled.append(cp_sc)
+                                mid_sizes.append(_shape_bbox_size(cp_sc))
                                 if has_valid_masks:
                                     cp_mask_u8 = np.where(
                                         cp_alpha.detach().cpu().numpy(), 255, 0
@@ -1700,16 +1809,17 @@ def merge_struct_shapes(
                             )
 
                     if best_cand is None:
-                        j += 1
                         continue
 
                     # Accept merge at position i with intermediate cutouts and remove j
                     _, curr_img, accepted_path, acc_alpha, acc_area, shapes, shape_groups = best_cand
                     acc_sampled = _sample_bezier_points(accepted_path.points)
+                    acc_size = _shape_bbox_size(acc_sampled)
 
                     alphas = alphas[:i] + [acc_alpha] + mid_alphas + alphas[j + 1 :]
                     areas = areas[:i] + [acc_area] + mid_areas + areas[j + 1 :]
                     sampled_curves = sampled_curves[:i] + [acc_sampled] + mid_sampled + sampled_curves[j + 1 :]
+                    shape_sizes = shape_sizes[:i] + [acc_size] + mid_sizes + shape_sizes[j + 1 :]
 
                     if has_valid_masks:
                         merged_mask_u8 = np.maximum(flat_masks[i], flat_masks[j])
@@ -1717,10 +1827,12 @@ def merge_struct_shapes(
                         flat_layer_ids = flat_layer_ids[:i] + [flat_layer_ids[i]] + mid_lids + flat_layer_ids[j + 1 :]
 
                     merged_any = True
-                    changed = True
                     break
 
-                if not merged_any:
+                if merged_any:
+                    # Merge accepted: restart the scan from the bottom of the stack on the updated shapes
+                    i = 1
+                else:
                     i += 1
 
     if has_valid_masks:

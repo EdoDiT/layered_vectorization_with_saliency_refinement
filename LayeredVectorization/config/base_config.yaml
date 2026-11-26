@@ -14,8 +14,9 @@ paths_remove_visual_threshold: 7.0
 
 # Structural shape merging phase (after color fitting, before concave simplification)
 is_merge_struct: True
-struct_merge_distance_threshold: 60.0
-struct_merge_color_range_pct: 0.05
+struct_merge_distance_scale: 0.60
+struct_merge_color_range_pct: 0.10
+struct_merge_min_overlap_pct: 0.05
 struct_merge_max_area_change_pct: 0.07
 
 # Concave simplification phase (after structural shape merging)
