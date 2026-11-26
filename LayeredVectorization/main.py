@@ -257,18 +257,6 @@ def layered_vectorization(args,device=None):
                                                   struct_svgs_save_path,
                                                   args.train,
                                                   args.base_lr)
-    if getattr(args, "is_simplify_concave", True):
-        print("Concave Simplification...")
-        shapes,shape_groups = simplify_concave_shapes(
-            device,
-            shapes,
-            shape_groups,
-            target_img,
-            sse_threshold=getattr(args, "concave_sse_threshold", 1.0),
-            max_changed_pct=getattr(args, "concave_max_changed_pct", 0.0015),
-            straighten_segments=getattr(args, "is_straighten_concave_segments", False),
-        )
-        pydiffvg.save_svg(f"./workdir/{args.file_save_name}/concave_simplified.svg",img_height,img_width,shapes,shape_groups)
     if args.color_fitting_type not in ["dominan","mse"]:
         raise ValueError(f"args.color_fitting_type can only be 'dominan' or 'mse', but the values passed in are {args.color_fitting_type}")
     if args.color_fitting_type == "dominan":
@@ -285,12 +273,22 @@ def layered_vectorization(args,device=None):
             target_img,
             layerd_struct_masks,
             distance_threshold=getattr(args, "struct_merge_distance_threshold", 60.0),
-            max_stack_gap_pct=getattr(args, "struct_merge_max_stack_gap_pct", 0.20),
             color_range_pct=getattr(args, "struct_merge_color_range_pct", 0.05),
-            max_area_change_pct=getattr(args, "struct_merge_max_area_change_pct", 0.10),
-            sse_threshold=getattr(args, "struct_merge_sse_threshold", 25.0),
+            max_area_change_pct=getattr(args, "struct_merge_max_area_change_pct", 0.07),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/struct_merged.svg",img_height,img_width,shapes,shape_groups)
+    if getattr(args, "is_simplify_concave", True):
+        print("Concave Simplification...")
+        shapes,shape_groups = simplify_concave_shapes(
+            device,
+            shapes,
+            shape_groups,
+            target_img,
+            sse_threshold=getattr(args, "concave_sse_threshold", 1.0),
+            max_changed_pct=getattr(args, "concave_max_changed_pct", 0.0015),
+            straighten_segments=getattr(args, "is_straighten_concave_segments", False),
+        )
+        pydiffvg.save_svg(f"./workdir/{args.file_save_name}/concave_simplified.svg",img_height,img_width,shapes,shape_groups)
 
     print("Visual Refinement...")
     pseudo_struct_masks = [mask for sublist in layerd_struct_masks for mask in sublist]
