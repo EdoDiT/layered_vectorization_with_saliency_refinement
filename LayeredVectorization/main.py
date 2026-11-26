@@ -435,6 +435,7 @@ def layered_vectorization(args,device=None):
             depth_margin=getattr(args, "depth_margin", 0.08),
             depth_touch_px=getattr(args, "depth_touch_px", 5),
             fill_concavities=getattr(args, "is_fill_occluded_concavities", True),
+            fill_gap_close_px=getattr(args, "fill_gap_close_px", 6),
             fill_safety_erode_px=getattr(args, "fill_safety_erode_px", 3),
         )
         cv2.imwrite(f"./workdir/{args.file_save_name}/layer_targets_debug.png", debug_bgr)

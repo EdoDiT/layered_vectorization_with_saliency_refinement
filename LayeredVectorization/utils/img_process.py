@@ -976,6 +976,7 @@ def refine_layers_with_depth_and_fill(
     depth_margin: float = 0.08,
     depth_touch_px: int = 5,
     fill_concavities: bool = True,
+    fill_gap_close_px: int = 6,
     fill_safety_erode_px: int = 3,
 ):
     """Build multi-shape layers using pairwise depth occlusion between touching masks,
@@ -1124,6 +1125,11 @@ def refine_layers_with_depth_and_fill(
             for m in raw_layered[lid]:
                 running_union |= m > 0
 
+        close_k = (
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * fill_gap_close_px + 1, 2 * fill_gap_close_px + 1))
+            if fill_gap_close_px > 0
+            else None
+        )
         safe_k = (
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * fill_safety_erode_px + 1, 2 * fill_safety_erode_px + 1))
             if fill_safety_erode_px > 0
@@ -1149,8 +1155,11 @@ def refine_layers_with_depth_and_fill(
                 cv2.drawContours(hull_u8, [hull], -1, 255, thickness=cv2.FILLED)
                 hull_fg = hull_u8 > 0
 
+                # Bridge 2-6px unsegmented SAM seams between m_fg and h_union before safety erosion
                 allowed_u8 = (m_fg | h_union).astype(np.uint8) * 255
-                safe_fg = (cv2.erode(allowed_u8, safe_k) > 0) if safe_k is not None else (m_fg | h_union)
+                if close_k is not None:
+                    allowed_u8 = cv2.morphologyEx(allowed_u8, cv2.MORPH_CLOSE, close_k)
+                safe_fg = (cv2.erode(allowed_u8, safe_k) > 0) if safe_k is not None else (allowed_u8 > 0)
 
                 if len(layer_fgs) > 1:
                     other_fg = np.zeros((h, w), dtype=bool)

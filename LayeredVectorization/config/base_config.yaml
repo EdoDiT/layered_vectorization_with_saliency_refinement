@@ -19,6 +19,7 @@ depth_erode_px: 4
 depth_margin: 0.08
 depth_touch_px: 5
 is_fill_occluded_concavities: True
+fill_gap_close_px: 6
 fill_safety_erode_px: 3
 
 # Legacy global 1-shape-per-layer depth mode (keep False)
