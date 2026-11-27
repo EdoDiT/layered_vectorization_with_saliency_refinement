@@ -276,6 +276,7 @@ def layered_vectorization(args,device=None):
             color_range_pct=getattr(args, "struct_merge_color_range_pct", 0.10),
             min_overlap_pct=getattr(args, "struct_merge_min_overlap_pct", 0.05),
             max_area_change_pct=getattr(args, "struct_merge_max_area_change_pct", 0.07),
+            max_img_change_pct=getattr(args, "struct_merge_max_img_change_pct", 0.002),
         )
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/struct_merged.svg",img_height,img_width,shapes,shape_groups)
     if getattr(args, "is_simplify_concave", True):

@@ -1592,10 +1592,13 @@ def merge_struct_shapes(
     color_range_pct: float = 0.10,
     min_overlap_pct: float = 0.05,
     max_area_change_pct: float = 0.07,
+    max_img_change_pct: float = 0.002,
 ):
     """
     Merge structural shapes anywhere in the stack that are spatially close (within distance_scale
     times the larger shape's bounding-box diagonal) or overlapping, and have similar colors.
+    All eligible pairs across the stack are sorted globally by spatial distance (closest /
+    overlapping first); after each accepted merge the scan restarts from scratch.
     When two shapes overlap by at least min_overlap_pct of the smaller shape's area, they are
     merged along their exact outer Bezier silhouette union; otherwise (disjoint or barely touching)
     they are bridged via their outer convex-hull common tangents.
@@ -1615,6 +1618,7 @@ def merge_struct_shapes(
         return shapes, shape_groups, layerd_struct_masks
 
     img_height, img_width = target_img.shape[:2]
+    total_pixels = float(img_height * img_width)
     target_float = target_img.astype(np.float32) / 255.0
 
     # Per-channel full dynamic range modulated by image contrast (95th - 5th percentile)
@@ -1641,199 +1645,200 @@ def merge_struct_shapes(
             sampled_curves.append(sc)
             shape_sizes.append(_shape_bbox_size(sc))
 
-        # Keep index 0 (full-canvas background) intact; iteratively merge shapes 1..N-1 across the entire stack
-        # Scan pairs bottom-to-top; after every accepted merge restart from i = 1 so that all rejected
-        # pairs are re-evaluated against the updated stack. The pass ends when a full scan accepts nothing.
-        changed = True
-        while changed:
-            changed = False
-            i = 1
-            while i < len(shapes):
-                c_i = np.clip(shape_groups[i].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
-                pts_i = sampled_curves[i]
+        # Globally collect all eligible pairs (i, j) across shapes 1..N-1, sort by distance ascending
+        # (so overlapping/touching pairs merge before distant bridges), accept the first valid merge,
+        # and restart from scratch until a full pass accepts nothing.
+        while True:
+            colors_np = [
+                np.clip(sg.fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
+                for sg in shape_groups
+            ]
+            cand_pairs = []
+            for i_idx in range(1, len(shapes)):
+                pts_i = sampled_curves[i_idx]
                 if len(pts_i) == 0:
-                    i += 1
                     continue
-
-                # Find all candidate j > i matching color and dynamic distance, ordered by closest distance first
-                cand_js = []
-                for j_idx in range(i + 1, len(shapes)):
-                    c_j = np.clip(shape_groups[j_idx].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
+                c_i = colors_np[i_idx]
+                for j_idx in range(i_idx + 1, len(shapes)):
+                    c_j = colors_np[j_idx]
                     if np.any(np.abs(c_i - c_j) > channel_thresholds):
                         continue
                     pts_j = sampled_curves[j_idx]
                     if len(pts_j) == 0:
                         continue
                     min_dist = float(np.min(cdist(pts_i, pts_j)))
-                    max_dist = distance_scale * max(shape_sizes[i], shape_sizes[j_idx])
+                    max_dist = distance_scale * max(shape_sizes[i_idx], shape_sizes[j_idx])
                     if min_dist <= max_dist:
-                        cand_js.append((min_dist, j_idx))
+                        cand_pairs.append((min_dist, i_idx, j_idx))
 
-                cand_js.sort(key=lambda x: x[0])
-                merged_any = False
-                for _, j in cand_js:
-                    c_j = np.clip(shape_groups[j].fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
+            cand_pairs.sort(key=lambda x: (x[0], x[1], x[2]))
+            merged_any = False
 
-                    # 3. If shapes overlap by >= min_overlap_pct of the smaller shape, follow their exact
-                    #    outer silhouette union; only bridge with convex-hull tangents when disjoint / barely touching
-                    ov_ij = int(torch.sum(alphas[i] & alphas[j]).item())
-                    overlap_ratio = ov_ij / float(max(min(areas[i], areas[j]), 1))
-                    if overlap_ratio >= min_overlap_pct:
-                        candidates = _union_bezier_shapes(shapes[i], shapes[j])
-                    else:
-                        candidates = _generate_convex_bridge_candidates(shapes[i], shapes[j])
-                    if not candidates:
-                        continue
+            for _, i, j in cand_pairs:
+                c_i = colors_np[i]
+                c_j = colors_np[j]
 
-                    # Visible area of shapes i and j before merging
-                    upper_j = torch.zeros((img_height, img_width), dtype=torch.bool, device=device)
-                    for k in range(j + 1, len(shapes)):
-                        upper_j = upper_j | alphas[k]
-                    upper_i = upper_j | alphas[j]
-                    for k in range(i + 1, j):
-                        upper_i = upper_i | alphas[k]
-                    vis_i = alphas[i] & (~upper_i)
-                    vis_j = alphas[j] & (~upper_j)
-                    vis_area = int(torch.sum(vis_i | vis_j).item())
-                    if vis_area <= 0:
-                        continue
-
-                    # 4. Cut out top shape j from any intermediate shape k in (i, j) that overlaps j
-                    mid_shapes = []
-                    mid_fills = []
-                    mid_strokes = []
-                    mid_alphas = []
-                    mid_areas = []
-                    mid_sampled = []
-                    mid_sizes = []
-                    mid_masks = []
-                    mid_lids = []
-                    mask_j_inv_u8 = None
-                    if has_valid_masks:
-                        mask_j_inv_u8 = np.where(
-                            alphas[j].detach().cpu().numpy(), 0, 255
-                        ).astype(np.uint8)
-
-                    for k in range(i + 1, j):
-                        ov_j = int(torch.sum(alphas[k] & alphas[j]).item())
-                        if ov_j == 0:
-                            # Case 1: Disjoint from j -> keep k untouched
-                            mid_shapes.append(shapes[k])
-                            mid_fills.append(shape_groups[k].fill_color)
-                            mid_strokes.append(shape_groups[k].stroke_color)
-                            mid_alphas.append(alphas[k])
-                            mid_areas.append(areas[k])
-                            mid_sampled.append(sampled_curves[k])
-                            mid_sizes.append(shape_sizes[k])
-                            if has_valid_masks:
-                                mid_masks.append(flat_masks[k])
-                                mid_lids.append(flat_layer_ids[k])
-                        elif ov_j >= int(0.98 * areas[k]):
-                            # Case 2: Completely covered by j -> delete k
-                            continue
-                        else:
-                            # Case 3: Partially overlaps j -> cut j out of k (can produce 0, 1, or more shapes)
-                            cut_paths = _cutout_bezier_shape(shapes[k], shapes[j])
-                            valid_rem = alphas[k] & (~alphas[j])
-                            for cp in cut_paths:
-                                cp_alpha = _render_alpha_mask(img_width, img_height, [cp], device)
-                                cp_area = int(torch.sum(cp_alpha).item())
-                                if cp_area < 4:
-                                    continue
-                                if int(torch.sum(cp_alpha & valid_rem).item()) < int(0.8 * cp_area):
-                                    continue
-                                cp_sc = _sample_bezier_points(cp.points)
-                                mid_shapes.append(cp)
-                                mid_fills.append(shape_groups[k].fill_color.detach().clone())
-                                mid_strokes.append(shape_groups[k].stroke_color.detach().clone())
-                                mid_alphas.append(cp_alpha)
-                                mid_areas.append(cp_area)
-                                mid_sampled.append(cp_sc)
-                                mid_sizes.append(_shape_bbox_size(cp_sc))
-                                if has_valid_masks:
-                                    cp_mask_u8 = np.where(
-                                        cp_alpha.detach().cpu().numpy(), 255, 0
-                                    ).astype(np.uint8)
-                                    mid_masks.append(np.minimum(flat_masks[k], np.minimum(mask_j_inv_u8, cp_mask_u8)))
-                                    mid_lids.append(flat_layer_ids[k])
-
-                    # Area-weighted fill color for the merged shape
-                    w_i, w_j = areas[i], areas[j]
-                    merged_rgb = (w_i * c_i + w_j * c_j) / float(w_i + w_j)
-                    merged_fill = torch.FloatTensor(
-                        [float(merged_rgb[0]), float(merged_rgb[1]), float(merged_rgb[2]), 1.0]
-                    )
-                    own_shift = float(max(np.max(np.abs(c_i - merged_rgb)), np.max(np.abs(c_j - merged_rgb))))
-
-                    # 5. Evaluate candidates placed at the lower stack index i with cutouts applied in (i, j)
-                    best_cand = None
-                    prefix_fills = [g.fill_color for g in shape_groups[:i]]
-                    prefix_strokes = [g.stroke_color for g in shape_groups[:i]]
-                    suffix_fills = [g.fill_color for g in shape_groups[j + 1 :]]
-                    suffix_strokes = [g.stroke_color for g in shape_groups[j + 1 :]]
-
-                    all_fills = prefix_fills + [merged_fill] + mid_fills + suffix_fills
-                    all_strokes = prefix_strokes + [shape_groups[i].stroke_color] + mid_strokes + suffix_strokes
-
-                    for cand_path in candidates:
-                        shapes_cand = shapes[:i] + [cand_path] + mid_shapes + shapes[j + 1 :]
-                        groups_cand = [
-                            pydiffvg.ShapeGroup(
-                                shape_ids=torch.LongTensor([k_idx]),
-                                fill_color=all_fills[k_idx],
-                                stroke_color=all_strokes[k_idx],
-                            )
-                            for k_idx in range(len(shapes_cand))
-                        ]
-
-                        cand_img = rgba_to_rgb(
-                            svg_to_img(img_width, img_height, shapes_cand, groups_cand, device), device
-                        )
-                        px_diff = torch.max(torch.abs(cand_img - curr_img), dim=0)[0]
-                        changed_area = int(torch.sum(px_diff > (own_shift + 1e-3)).item())
-                        change_frac = changed_area / float(vis_area)
-                        if change_frac > max_area_change_pct:
-                            continue
-
-                        if best_cand is None or change_frac < best_cand[0]:
-                            cand_alpha = _render_alpha_mask(img_width, img_height, [cand_path], device)
-                            cand_area = max(int(torch.sum(cand_alpha).item()), 1)
-                            best_cand = (
-                                change_frac,
-                                cand_img,
-                                cand_path,
-                                cand_alpha,
-                                cand_area,
-                                shapes_cand,
-                                groups_cand,
-                            )
-
-                    if best_cand is None:
-                        continue
-
-                    # Accept merge at position i with intermediate cutouts and remove j
-                    _, curr_img, accepted_path, acc_alpha, acc_area, shapes, shape_groups = best_cand
-                    acc_sampled = _sample_bezier_points(accepted_path.points)
-                    acc_size = _shape_bbox_size(acc_sampled)
-
-                    alphas = alphas[:i] + [acc_alpha] + mid_alphas + alphas[j + 1 :]
-                    areas = areas[:i] + [acc_area] + mid_areas + areas[j + 1 :]
-                    sampled_curves = sampled_curves[:i] + [acc_sampled] + mid_sampled + sampled_curves[j + 1 :]
-                    shape_sizes = shape_sizes[:i] + [acc_size] + mid_sizes + shape_sizes[j + 1 :]
-
-                    if has_valid_masks:
-                        merged_mask_u8 = np.maximum(flat_masks[i], flat_masks[j])
-                        flat_masks = flat_masks[:i] + [merged_mask_u8] + mid_masks + flat_masks[j + 1 :]
-                        flat_layer_ids = flat_layer_ids[:i] + [flat_layer_ids[i]] + mid_lids + flat_layer_ids[j + 1 :]
-
-                    merged_any = True
-                    break
-
-                if merged_any:
-                    # Merge accepted: restart the scan from the bottom of the stack on the updated shapes
-                    i = 1
+                # 3. If shapes overlap by >= min_overlap_pct of the smaller shape, follow their exact
+                #    outer silhouette union; only bridge with convex-hull tangents when disjoint / barely touching
+                ov_ij = int(torch.sum(alphas[i] & alphas[j]).item())
+                overlap_ratio = ov_ij / float(max(min(areas[i], areas[j]), 1))
+                if overlap_ratio >= min_overlap_pct:
+                    candidates = _union_bezier_shapes(shapes[i], shapes[j])
                 else:
-                    i += 1
+                    candidates = _generate_convex_bridge_candidates(shapes[i], shapes[j])
+                if not candidates:
+                    continue
+
+                # Visible area of shapes i and j before merging
+                upper_j = torch.zeros((img_height, img_width), dtype=torch.bool, device=device)
+                for k in range(j + 1, len(shapes)):
+                    upper_j = upper_j | alphas[k]
+                upper_i = upper_j | alphas[j]
+                for k in range(i + 1, j):
+                    upper_i = upper_i | alphas[k]
+                vis_i = alphas[i] & (~upper_i)
+                vis_j = alphas[j] & (~upper_j)
+                vis_i_area = int(torch.sum(vis_i).item())
+                vis_j_area = int(torch.sum(vis_j).item())
+                if (vis_i_area + vis_j_area) <= 0:
+                    continue
+                min_vis_area = min(vis_i_area, vis_j_area)
+                ref_vis_area = min_vis_area if min_vis_area > 0 else max(vis_i_area, vis_j_area)
+
+                # 4. Cut out top shape j from any intermediate shape k in (i, j) that overlaps j
+                mid_shapes = []
+                mid_fills = []
+                mid_strokes = []
+                mid_alphas = []
+                mid_areas = []
+                mid_sampled = []
+                mid_sizes = []
+                mid_masks = []
+                mid_lids = []
+                mask_j_inv_u8 = None
+                if has_valid_masks:
+                    mask_j_inv_u8 = np.where(
+                        alphas[j].detach().cpu().numpy(), 0, 255
+                    ).astype(np.uint8)
+
+                for k in range(i + 1, j):
+                    ov_j = int(torch.sum(alphas[k] & alphas[j]).item())
+                    if ov_j == 0:
+                        # Case 1: Disjoint from j -> keep k untouched
+                        mid_shapes.append(shapes[k])
+                        mid_fills.append(shape_groups[k].fill_color)
+                        mid_strokes.append(shape_groups[k].stroke_color)
+                        mid_alphas.append(alphas[k])
+                        mid_areas.append(areas[k])
+                        mid_sampled.append(sampled_curves[k])
+                        mid_sizes.append(shape_sizes[k])
+                        if has_valid_masks:
+                            mid_masks.append(flat_masks[k])
+                            mid_lids.append(flat_layer_ids[k])
+                    elif ov_j >= int(0.98 * areas[k]):
+                        # Case 2: Completely covered by j -> delete k
+                        continue
+                    else:
+                        # Case 3: Partially overlaps j -> cut j out of k (can produce 0, 1, or more shapes)
+                        cut_paths = _cutout_bezier_shape(shapes[k], shapes[j])
+                        valid_rem = alphas[k] & (~alphas[j])
+                        for cp in cut_paths:
+                            cp_alpha = _render_alpha_mask(img_width, img_height, [cp], device)
+                            cp_area = int(torch.sum(cp_alpha).item())
+                            if cp_area < 4:
+                                continue
+                            if int(torch.sum(cp_alpha & valid_rem).item()) < int(0.8 * cp_area):
+                                continue
+                            cp_sc = _sample_bezier_points(cp.points)
+                            mid_shapes.append(cp)
+                            mid_fills.append(shape_groups[k].fill_color.detach().clone())
+                            mid_strokes.append(shape_groups[k].stroke_color.detach().clone())
+                            mid_alphas.append(cp_alpha)
+                            mid_areas.append(cp_area)
+                            mid_sampled.append(cp_sc)
+                            mid_sizes.append(_shape_bbox_size(cp_sc))
+                            if has_valid_masks:
+                                cp_mask_u8 = np.where(
+                                    cp_alpha.detach().cpu().numpy(), 255, 0
+                                ).astype(np.uint8)
+                                mid_masks.append(np.minimum(flat_masks[k], np.minimum(mask_j_inv_u8, cp_mask_u8)))
+                                mid_lids.append(flat_layer_ids[k])
+
+                # Area-weighted fill color for the merged shape
+                w_i, w_j = areas[i], areas[j]
+                merged_rgb = (w_i * c_i + w_j * c_j) / float(w_i + w_j)
+                merged_fill = torch.FloatTensor(
+                    [float(merged_rgb[0]), float(merged_rgb[1]), float(merged_rgb[2]), 1.0]
+                )
+                own_shift = float(max(np.max(np.abs(c_i - merged_rgb)), np.max(np.abs(c_j - merged_rgb))))
+
+                # 5. Evaluate candidates placed at the lower stack index i with cutouts applied in (i, j)
+                best_cand = None
+                prefix_fills = [g.fill_color for g in shape_groups[:i]]
+                prefix_strokes = [g.stroke_color for g in shape_groups[:i]]
+                suffix_fills = [g.fill_color for g in shape_groups[j + 1 :]]
+                suffix_strokes = [g.stroke_color for g in shape_groups[j + 1 :]]
+
+                all_fills = prefix_fills + [merged_fill] + mid_fills + suffix_fills
+                all_strokes = prefix_strokes + [shape_groups[i].stroke_color] + mid_strokes + suffix_strokes
+
+                for cand_path in candidates:
+                    shapes_cand = shapes[:i] + [cand_path] + mid_shapes + shapes[j + 1 :]
+                    groups_cand = [
+                        pydiffvg.ShapeGroup(
+                            shape_ids=torch.LongTensor([k_idx]),
+                            fill_color=all_fills[k_idx],
+                            stroke_color=all_strokes[k_idx],
+                        )
+                        for k_idx in range(len(shapes_cand))
+                    ]
+
+                    cand_img = rgba_to_rgb(
+                        svg_to_img(img_width, img_height, shapes_cand, groups_cand, device), device
+                    )
+                    px_diff = torch.max(torch.abs(cand_img - curr_img), dim=0)[0]
+                    changed_area = int(torch.sum(px_diff > (own_shift + 1e-3)).item())
+                    img_change_frac = changed_area / total_pixels
+                    shape_change_frac = changed_area / float(ref_vis_area)
+                    if img_change_frac > max_img_change_pct or shape_change_frac > max_area_change_pct:
+                        continue
+
+                    if best_cand is None or shape_change_frac < best_cand[0]:
+                        cand_alpha = _render_alpha_mask(img_width, img_height, [cand_path], device)
+                        cand_area = max(int(torch.sum(cand_alpha).item()), 1)
+                        best_cand = (
+                            shape_change_frac,
+                            cand_img,
+                            cand_path,
+                            cand_alpha,
+                            cand_area,
+                            shapes_cand,
+                            groups_cand,
+                        )
+
+                if best_cand is None:
+                    continue
+
+                # Accept merge at position i with intermediate cutouts, remove j, and restart global scan
+                _, curr_img, accepted_path, acc_alpha, acc_area, shapes, shape_groups = best_cand
+                acc_sampled = _sample_bezier_points(accepted_path.points)
+                acc_size = _shape_bbox_size(acc_sampled)
+
+                alphas = alphas[:i] + [acc_alpha] + mid_alphas + alphas[j + 1 :]
+                areas = areas[:i] + [acc_area] + mid_areas + areas[j + 1 :]
+                sampled_curves = sampled_curves[:i] + [acc_sampled] + mid_sampled + sampled_curves[j + 1 :]
+                shape_sizes = shape_sizes[:i] + [acc_size] + mid_sizes + shape_sizes[j + 1 :]
+
+                if has_valid_masks:
+                    merged_mask_u8 = np.maximum(flat_masks[i], flat_masks[j])
+                    flat_masks = flat_masks[:i] + [merged_mask_u8] + mid_masks + flat_masks[j + 1 :]
+                    flat_layer_ids = flat_layer_ids[:i] + [flat_layer_ids[i]] + mid_lids + flat_layer_ids[j + 1 :]
+
+                merged_any = True
+                break
+
+            if not merged_any:
+                break
 
     if has_valid_masks:
         new_layer_dict = {}
