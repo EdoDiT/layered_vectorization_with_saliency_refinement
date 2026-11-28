@@ -1614,7 +1614,7 @@ def merge_struct_shapes(
                 flat_layer_ids.append(layer_idx)
 
     has_valid_masks = (layerd_struct_masks is not None) and (len(flat_masks) == len(shapes))
-    if len(shapes) <= 2:
+    if len(shapes) <= 1:
         return shapes, shape_groups, layerd_struct_masks
 
     img_height, img_width = target_img.shape[:2]
@@ -1645,16 +1645,17 @@ def merge_struct_shapes(
             sampled_curves.append(sc)
             shape_sizes.append(_shape_bbox_size(sc))
 
-        # Globally collect all eligible pairs (i, j) across shapes 1..N-1, sort by distance ascending
-        # (so overlapping/touching pairs merge before distant bridges), accept the first valid merge,
-        # and restart from scratch until a full pass accepts nothing.
+        # Globally collect all eligible pairs (i, j) across shapes 0..N-1 in two priority tiers:
+        #   tier 0 (union): overlap_ratio >= min_overlap_pct, sorted by highest overlap first
+        #   tier 1 (bridge): disjoint / barely touching within max_dist, sorted by closest first
+        # Accept the first valid merge and restart from scratch until a full pass accepts nothing.
         while True:
             colors_np = [
                 np.clip(sg.fill_color[:3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float32)
                 for sg in shape_groups
             ]
             cand_pairs = []
-            for i_idx in range(1, len(shapes)):
+            for i_idx in range(len(shapes)):
                 pts_i = sampled_curves[i_idx]
                 if len(pts_i) == 0:
                     continue
@@ -1666,23 +1667,26 @@ def merge_struct_shapes(
                     pts_j = sampled_curves[j_idx]
                     if len(pts_j) == 0:
                         continue
-                    min_dist = float(np.min(cdist(pts_i, pts_j)))
-                    max_dist = distance_scale * max(shape_sizes[i_idx], shape_sizes[j_idx])
-                    if min_dist <= max_dist:
-                        cand_pairs.append((min_dist, i_idx, j_idx))
+                    ov_ij = int(torch.sum(alphas[i_idx] & alphas[j_idx]).item())
+                    overlap_ratio = ov_ij / float(max(min(areas[i_idx], areas[j_idx]), 1))
+                    if overlap_ratio >= min_overlap_pct:
+                        cand_pairs.append((0, -overlap_ratio, i_idx, j_idx))
+                    else:
+                        min_dist = 0.0 if ov_ij > 0 else float(np.min(cdist(pts_i, pts_j)))
+                        max_dist = distance_scale * max(shape_sizes[i_idx], shape_sizes[j_idx])
+                        if min_dist <= max_dist:
+                            cand_pairs.append((1, min_dist, i_idx, j_idx))
 
-            cand_pairs.sort(key=lambda x: (x[0], x[1], x[2]))
+            cand_pairs.sort()
             merged_any = False
 
-            for _, i, j in cand_pairs:
+            for tier, _, i, j in cand_pairs:
                 c_i = colors_np[i]
                 c_j = colors_np[j]
 
-                # 3. If shapes overlap by >= min_overlap_pct of the smaller shape, follow their exact
-                #    outer silhouette union; only bridge with convex-hull tangents when disjoint / barely touching
-                ov_ij = int(torch.sum(alphas[i] & alphas[j]).item())
-                overlap_ratio = ov_ij / float(max(min(areas[i], areas[j]), 1))
-                if overlap_ratio >= min_overlap_pct:
+                # 3. Tier 0 (>= min_overlap_pct): exact outer silhouette union;
+                #    Tier 1 (disjoint / barely touching): convex-hull tangent bridge
+                if tier == 0:
                     candidates = _union_bezier_shapes(shapes[i], shapes[j])
                 else:
                     candidates = _generate_convex_bridge_candidates(shapes[i], shapes[j])
