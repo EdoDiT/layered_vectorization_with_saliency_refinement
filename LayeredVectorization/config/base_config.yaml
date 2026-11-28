@@ -17,7 +17,7 @@ is_merge_struct: True
 struct_merge_distance_scale: 0.60
 struct_merge_color_range_pct: 0.10
 struct_merge_min_overlap_pct: 0.05
-struct_merge_max_area_change_pct: 0.07
+struct_merge_max_area_change_pct: null # null or <= 0 disables relative shape cap
 struct_merge_max_img_change_pct: 0.002
 
 # Concave simplification phase (after structural shape merging)
